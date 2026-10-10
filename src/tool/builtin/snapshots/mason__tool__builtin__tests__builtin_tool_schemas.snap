@@ -1,0 +1,274 @@
+---
+source: src/tool/builtin/mod.rs
+expression: "serde_json::to_string_pretty(&specs).unwrap()"
+---
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "read",
+      "description": "Read a file (or list a directory). Lines are prefixed with their 1-based number (\"12: text\"). Reads about 2000 lines (or 48 KiB) per page; use offset and limit for larger files.",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "description": "Arguments of the `read` tool.",
+        "properties": {
+          "filePath": {
+            "description": "Path to the file, absolute or relative to the working directory.",
+            "type": "string"
+          },
+          "limit": {
+            "default": 1998,
+            "description": "Number of lines to read (default and maximum 1998, one page).",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "offset": {
+            "default": 1,
+            "description": "Line number to start from (1-based).",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "filePath"
+        ],
+        "title": "ReadArgs",
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "write",
+      "description": "Write a file, replacing it if it exists. Parent directories are created. Prefer edit for changing existing files.",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "description": "Arguments of the `write` tool.",
+        "properties": {
+          "content": {
+            "description": "The full file content.",
+            "type": "string"
+          },
+          "filePath": {
+            "description": "Path to the file.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "filePath",
+          "content"
+        ],
+        "title": "WriteArgs",
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "edit",
+      "description": "Replace oldString with newString in a file. oldString must match one place in the file (include surrounding lines to make it unique) unless replaceAll is set. An empty oldString creates a new file with newString as its content.",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "description": "Arguments of the `edit` tool.",
+        "properties": {
+          "filePath": {
+            "description": "Path to the file.",
+            "type": "string"
+          },
+          "newString": {
+            "description": "The replacement text.",
+            "type": "string"
+          },
+          "oldString": {
+            "description": "The text to replace.",
+            "type": "string"
+          },
+          "replaceAll": {
+            "default": false,
+            "description": "Replace every occurrence (default false).",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "filePath",
+          "oldString",
+          "newString"
+        ],
+        "title": "EditArgs",
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "bash",
+      "description": "Run a shell command and return its combined stdout/stderr and exit code. Use workdir instead of cd. Long output is truncated to its tail with the full output saved to a file. Returns when the command exits. Background processes belong to this session and keep running between messages; use process to list or stop them. Later output is discarded.",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "description": "Arguments of the `bash` tool.",
+        "properties": {
+          "command": {
+            "description": "The command to run.",
+            "type": "string"
+          },
+          "timeout": {
+            "description": "Timeout in ms; host defaults are usually 120000 with a 600000 maximum.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "workdir": {
+            "description": "Directory to run in (default: the working directory).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "title": "BashArgs",
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "grep",
+      "description": "Search file contents with a regular expression (ripgrep syntax). Returns \"path:line:text\" for up to 100 matching lines. Respects .gitignore unless includeIgnored is set; binary files are skipped.",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "description": "Arguments of the `grep` tool.",
+        "properties": {
+          "caseInsensitive": {
+            "description": "Match regardless of letter case (default: false).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "include": {
+            "description": "Only search files matching this glob, e.g. \"*.ts\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "includeIgnored": {
+            "description": "Also search ignored files such as node_modules or build output (default: false).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "File or directory to search (default: the working directory).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pattern": {
+            "description": "The regular expression to search for (ripgrep syntax).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "title": "GrepArgs",
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "glob",
+      "description": "List files matching a glob pattern such as \"src/**/*.ts\" (up to 100). Respects .gitignore unless includeIgnored is set.",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "description": "Arguments of the `glob` tool.",
+        "properties": {
+          "includeIgnored": {
+            "description": "Also list ignored files such as node_modules or build output (default: false).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "Directory to search (default: the working directory).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pattern": {
+            "description": "The glob pattern, e.g. \"src/**/*.ts\".",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "title": "GlobArgs",
+        "type": "object"
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "process",
+      "description": "List or stop background shell process groups owned by this session. They keep running between messages until stopped.",
+      "parameters": {
+        "$defs": {
+          "ProcessAction": {
+            "enum": [
+              "list",
+              "stop"
+            ],
+            "type": "string"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "$ref": "#/$defs/ProcessAction"
+          },
+          "pid": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "ProcessArgs",
+        "type": "object"
+      }
+    }
+  }
+]

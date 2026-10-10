@@ -1,0 +1,4 @@
+/target
+/.mason/
+/.env
+/mcp.json

@@ -1,0 +1,70 @@
+# An example application manifest: everything an embedding app needs that is
+# data. This one runs as-is against the builtin tools:
+#
+#   mason serve --config examples/agent.yaml --db /tmp/example.db
+#
+# Native tools, a custom ChatModel/SessionStore and approval hooks stay in code:
+# `Manifest::load(path)?.into_builder().await?` returns an AgentBuilder to extend.
+version: 1
+
+# Appended verbatim after mason's generic system prompt. No secrets here: model
+# credentials come from the AI_* environment variables.
+instructions: |
+  You are an agent working on the Acme service. Investigate before changing
+  anything, and keep changes to what the task asks for.
+
+profiles:
+  # A new name registers a domain profile; a description is required.
+  unattended:
+    description: Unattended investigation of a reported problem.
+    prompt: |
+      This is unattended triage. Investigate read-only and propose fixes for
+      human review; never apply them. Finish by recording your conclusion.
+    tools: [read, grep, glob]
+    max_steps: 30
+  # A builtin name patches the resolved builtin: only the tools change, and the
+  # profile keeps its snapshot text, step limit and subagent status.
+  explore:
+    tools: [read, grep, glob, skill]
+  build:
+    allowed_subagents: [general, explore]
+
+# Chooses the profile of a stored top-level session from its opaque metadata.
+# Conditions are ANDed, the first matching rule wins, and `present` means the
+# path exists and is not null.
+select_profile:
+  - profile: unattended
+    when_metadata:
+      tenant_id:
+        present: true
+
+# MCP servers use the opencode format and are mounted as `<server>_<tool>`; they
+# also need `allow_mcp: true` below. A local server without `cwd` inherits the
+# agent's working directory. `{env:NAME}` in command, environment, url or
+# headers expands from mason's environment.
+# mcp:
+#   acme:
+#     type: local
+#     command: [node, tools/mcp-server.js]
+#     environment:
+#       ACME_CONFIG: etc/config.json
+#       ACME_TOKEN: "{env:ACME_TOKEN}"
+
+# `trusted` (the default) grants full host access; `sandbox` confines
+# subprocesses and file tools to the workspace.
+execution_mode: trusted
+# Both fail closed.
+allow_network: false
+allow_mcp: false
+
+# Paths resolve against this file's directory.
+# skills_dir: skills
+# prompts: prompts.yaml
+# cwd: .
+# spill: var/spill        # trusted mode only; sandbox confines spill to the workspace
+
+# Budgets, named like their flags (`mason run --help` lists them all); omitted
+# ones keep mason's defaults. Durations are `90s`, `15m` or `1h30m`.
+limits:
+  timeout: 15m
+  shell_timeout: 5m

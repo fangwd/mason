@@ -1,0 +1,65 @@
+[package]
+name = "mason"
+version = "0.1.0"
+edition = "2024"
+# SQLx requires Rust 1.94.
+rust-version = "1.94"
+description = "Domain-independent agent core: model/tool loop, LLM client, tools, context management, subagents, skills, sessions and an HTTP API."
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["fs","io-std","io-util","macros","net","process","rt-multi-thread","signal","sync","time"] }
+tokio-util = "0.7"
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+regex = "1"
+serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }
+schemars = "1.2"
+async-trait = "0.1"
+thiserror = "2"
+clap = { version = "4", features = ["derive","env"] }
+tempfile = "3"
+http = "1"
+reqwest = { version = "0.13", default-features = false, features = ["json","rustls","http2","charset","stream"] }
+axum = { version = "0.8", default-features = false, features = ["json","tokio","http1","query"] }
+sqlx = { version = "0.9", default-features = false, features = ["sqlite","runtime-tokio","migrate","macros","chrono"] }
+ignore = "0.4"
+globset = "0.4"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter","fmt"] }
+uuid = { version = "1", features = ["v4"] }
+rand = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dependencies.rmcp]
+version = "3.5"
+optional = true
+default-features = false
+features = ["client","transport-async-rw","transport-child-process",
+            "transport-streamable-http-client-reqwest"]
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["signal","process","user","fs"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+wiremock = "0.6"
+tempfile = "3"
+filetime = "0.2"
+insta = { version = "1", features = ["yaml"] }
+proptest = "1"
+# Test fixtures need MCP server support; production is client-only.
+rmcp = { version = "3.5", default-features = false, features = ["client","server","transport-async-rw","transport-child-process","transport-streamable-http-client-reqwest"] }
+
+[[example]]
+name = "mcp_fixture"
+required-features = ["mcp"]
+
+[features]
+default = ["mcp"]
+mcp = ["dep:rmcp"]
