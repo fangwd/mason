@@ -185,7 +185,7 @@ async fn scattered_repeats_do_not_stop_a_long_run() {
 }
 
 #[tokio::test]
-async fn stops_after_three_warnings() {
+async fn a_repeat_during_recovery_stops_without_executing_the_disabled_tool() {
     let dir = tempfile::tempdir().unwrap();
     let (echo, executed) = EchoTool::boxed("echo", "unchanged");
     let replies: Vec<Reply> = (0..20).map(|_| call("echo", r#"{"n":0}"#)).collect();
@@ -194,17 +194,196 @@ async fn stops_after_three_warnings() {
     config.persist = Some(persist);
     let err = engine::run(config).await.unwrap_err();
     assert!(err.to_string().contains("3 doom-loop warnings"), "{err}");
-    // Warned patterns keep counting on purpose: repeats 3, 4 and 5 warn,
-    // then the run stops.
+    // Repeats 3, 4 and 5 warn. One recovery request follows, but its
+    // attempt to call the withheld tool never executes.
     assert_eq!(executed.load(Ordering::SeqCst), 5);
-    assert_eq!(model.request_count(), 5);
+    assert_eq!(model.request_count(), 6);
+    assert!(
+        err.to_string().contains("disabled tool during recovery"),
+        "{err}"
+    );
+    let recovery = &model.requests()[5];
+    assert!(recovery.tools.is_empty());
+    assert!(
+        recovery
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("No tools are available for this turn")
+    );
     let tool_messages = saved
         .lock()
         .unwrap()
         .iter()
         .filter(|message| message.role == mason::Role::Tool)
         .count();
-    assert_eq!(tool_messages, 5);
+    assert_eq!(tool_messages, 6);
+}
+
+#[tokio::test]
+async fn a_doom_loop_can_recover_with_a_different_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let (inspect, inspected) = EchoTool::boxed("inspect", "unchanged evidence");
+    let (validate, validated) = EchoTool::boxed("validate", "all fixtures passed");
+    let mut replies: Vec<Reply> = (0..5).map(|_| Reply::Message(
+        serde_json::from_value(serde_json::json!({
+            "role": "assistant", "content": null, "reasoning_content": "inspect again",
+            "tool_calls": [{"id": "inspect", "type": "function", "function": {"name": "inspect", "arguments": "{}"}}]
+        })).unwrap()
+    )).collect();
+    replies.extend([call("validate", "{}"), answer("validated")]);
+    let (config, model) = config(replies, vec![inspect, validate], dir.path()).await;
+    let outcome = engine::run(config).await.unwrap();
+    assert_eq!(outcome.answer, "validated");
+    assert_eq!(inspected.load(Ordering::SeqCst), 5);
+    assert_eq!(validated.load(Ordering::SeqCst), 1);
+    let requests = model.requests();
+    assert!(
+        requests[4]
+            .messages
+            .iter()
+            .any(|message| message.reasoning_content.is_some())
+    );
+    assert!(
+        requests[5]
+            .messages
+            .iter()
+            .all(|message| message.reasoning_content.is_none()),
+        "the recovery instruction starts a new reasoning round"
+    );
+    assert_eq!(
+        requests[5]
+            .tools
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect::<Vec<_>>(),
+        ["validate"]
+    );
+    assert!(
+        requests[5]
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("Mason runtime recovery")
+    );
+    assert_eq!(
+        requests[6].tools.len(),
+        2,
+        "normal tools return after the recovery turn"
+    );
+    assert_eq!(tool_results(&outcome.messages).len(), 6);
+}
+
+#[tokio::test]
+async fn doom_recovery_does_not_extend_the_step_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (inspect, inspected) = EchoTool::boxed("inspect", "unchanged evidence");
+    let (validate, validated) = EchoTool::boxed("validate", "should not run");
+    let mut replies: Vec<Reply> = (0..5).map(|_| call("inspect", "{}")).collect();
+    replies.push(answer("The work is unfinished; the step budget is spent."));
+    let (mut config, model) = config(replies, vec![inspect, validate], dir.path()).await;
+    config.limits.max_steps = 5;
+    let outcome = engine::run(config).await.unwrap();
+    assert!(outcome.answer.contains("unfinished"));
+    assert_eq!(inspected.load(Ordering::SeqCst), 5);
+    assert_eq!(validated.load(Ordering::SeqCst), 0);
+    let requests = model.requests();
+    assert_eq!(requests.len(), 6);
+    assert!(
+        requests[5].tools.is_empty(),
+        "the wrap-up turn stays text-only"
+    );
+    let prompts = PromptSource::Embedded.load().unwrap();
+    assert!(
+        requests[5]
+            .messages
+            .iter()
+            .any(|message| message.content.as_deref() == Some(prompts.max_steps.as_str()))
+    );
+}
+
+#[tokio::test]
+async fn a_recovery_on_the_final_turn_keeps_the_answer_despite_a_withheld_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let (inspect, inspected) = EchoTool::boxed("inspect", "unchanged evidence");
+    let mut replies: Vec<Reply> = (0..5).map(|_| call("inspect", "{}")).collect();
+    replies.push(Reply::Message(
+        serde_json::from_value(serde_json::json!({
+            "role": "assistant", "content": "Partial summary of the work.",
+            "tool_calls": [{"id": "late", "type": "function", "function": {"name": "inspect", "arguments": "{}"}}]
+        }))
+        .unwrap(),
+    ));
+    let (mut config, model) = config(replies, vec![inspect], dir.path()).await;
+    config.limits.max_steps = 5;
+    let outcome = engine::run(config).await.unwrap();
+    assert_eq!(outcome.answer, "Partial summary of the work.");
+    assert_eq!(inspected.load(Ordering::SeqCst), 5);
+    let requests = model.requests();
+    assert_eq!(requests.len(), 6);
+    assert!(requests[5].tools.is_empty());
+    assert!(
+        requests[5].messages.iter().all(|message| !message
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Mason runtime recovery")),
+        "the final turn sends only the wrap-up prompt"
+    );
+}
+
+#[tokio::test]
+async fn a_second_doom_loop_stops_instead_of_recovering_forever() {
+    let dir = tempfile::tempdir().unwrap();
+    let (inspect, inspected) = EchoTool::boxed("inspect", "unchanged evidence");
+    let (other, used_other) = EchoTool::boxed("other", "unchanged alternative");
+    let mut replies: Vec<Reply> = (0..5).map(|_| call("inspect", "{}")).collect();
+    replies.extend((0..10).map(|_| call("other", "{}")));
+    let (config, model) = config(replies, vec![inspect, other], dir.path()).await;
+    let err = engine::run(config).await.unwrap_err();
+    assert!(
+        err.to_string().contains("following a recovery attempt"),
+        "{err}"
+    );
+    assert_eq!(inspected.load(Ordering::SeqCst), 5);
+    assert_eq!(used_other.load(Ordering::SeqCst), 5);
+    assert_eq!(model.request_count(), 10);
+}
+
+#[tokio::test]
+async fn a_blocked_recovery_reply_executes_no_sibling_calls_and_persists_all_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let (inspect, inspected) = EchoTool::boxed("inspect", "unchanged evidence");
+    let (other, used_other) = EchoTool::boxed("other", "should not run");
+    let mut replies: Vec<Reply> = (0..5).map(|_| call("inspect", "{}")).collect();
+    replies.push(calls(vec![
+        ("allowed".into(), "other".into(), "{}".into()),
+        ("blocked".into(), "inspect".into(), "{}".into()),
+    ]));
+    let (mut config, _) = config(replies, vec![inspect, other], dir.path()).await;
+    let (persist, saved) = recorder();
+    config.persist = Some(persist);
+    let err = engine::run(config).await.unwrap_err();
+    assert!(
+        err.to_string().contains("disabled tool during recovery"),
+        "{err}"
+    );
+    assert_eq!(inspected.load(Ordering::SeqCst), 5);
+    assert_eq!(used_other.load(Ordering::SeqCst), 0);
+    let saved = saved.lock().unwrap();
+    let results: Vec<_> = saved
+        .iter()
+        .filter(|message| message.role == Role::Tool)
+        .collect();
+    assert_eq!(results.len(), 7);
+    assert_eq!(results[5].tool_call_id.as_deref(), Some("allowed"));
+    assert_eq!(results[6].tool_call_id.as_deref(), Some("blocked"));
 }
 
 #[tokio::test]

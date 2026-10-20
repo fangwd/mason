@@ -1,6 +1,6 @@
 //! Streaming model/tool loop with bounded concurrency, persistence, and cancellation.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -348,6 +348,7 @@ async fn guarded<T>(
 struct DoomState {
     calls: StdMutex<VecDeque<String>>,
     warnings: AtomicUsize,
+    warned_tools: StdMutex<HashSet<String>>,
 }
 
 impl DoomState {
@@ -360,8 +361,19 @@ impl DoomState {
         calls.iter().filter(|k| *k == key).count()
     }
 
-    fn warn(&self) -> usize {
+    fn warn(&self, name: &str) -> usize {
+        self.warned_tools
+            .lock()
+            .expect("the doom state is not poisoned")
+            .insert(name.to_owned());
         self.warnings.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn warned_tools(&self) -> HashSet<String> {
+        self.warned_tools
+            .lock()
+            .expect("the doom state is not poisoned")
+            .clone()
     }
 
     fn warnings(&self) -> usize {
@@ -372,6 +384,10 @@ impl DoomState {
     /// stops a run, not three scattered repeats over a long one.
     fn clear_warnings(&self) {
         self.warnings.store(0, Ordering::SeqCst);
+        self.warned_tools
+            .lock()
+            .expect("the doom state is not poisoned")
+            .clear();
     }
 }
 
@@ -417,6 +433,10 @@ async fn run_loop(
     // Leaves the final text-only turn time to answer before the hard deadline.
     let wrap_up_at = Instant::now() + limits.timeout - limits.timeout / 10;
     let mut output_limit_hit = false;
+    // One recovery attempt per run, within the existing step/time/token budgets.
+    let mut recovery_used = false;
+    let mut recovery_pending = false;
+    let mut recovery_tools = HashSet::new();
 
     for step in 1usize.. {
         if token.is_cancelled() {
@@ -450,17 +470,44 @@ async fn run_loop(
             last_step = true;
         }
 
+        // The final text-only turn already withholds every tool.
+        let recovering = recovery_pending && !last_step;
         let send = |mut messages: Vec<Message>| {
+            let tools: Vec<_> = if last_step {
+                Vec::new()
+            } else {
+                specs
+                    .iter()
+                    .filter(|spec| !recovering || !recovery_tools.contains(&spec.function.name))
+                    .cloned()
+                    .collect()
+            };
             if output_limit_hit {
                 messages.push(Message::user(prompts.output_limit.clone()));
             }
             if last_step {
                 messages.push(Message::user(prompts.max_steps.clone()));
             }
-            ChatRequest {
-                messages,
-                tools: if last_step { Vec::new() } else { specs.clone() },
+            if recovering {
+                let mut names: Vec<_> = recovery_tools.iter().cloned().collect();
+                names.sort();
+                let next = if tools.is_empty() {
+                    "No tools are available for this turn. If the task is complete, answer now; \
+                     otherwise report the blocker and unfinished work."
+                } else {
+                    "Use the evidence already collected to make the next concrete change or validation \
+                     with another available tool. If the task is complete, answer now. If you cannot \
+                     make progress, report the blocker and unfinished work. Do not repeat the inspection."
+                };
+                messages.push(Message::user(format!(
+                    "[Mason runtime recovery] Repeated tool calls exhausted the doom-loop warning budget. \
+                     The following tools are unavailable for this turn: {}. {next} \
+                     This is the only recovery attempt; run budgets still apply.",
+                    names.join(", ")
+                )));
+                strip_stale_reasoning(&mut messages);
             }
+            ChatRequest { messages, tools }
         };
 
         let mut turn = run_turn(&model, send(view), &token, &shared, step as u32).await;
@@ -500,6 +547,23 @@ async fn run_loop(
         shared.commit(step as u32, assistant.clone()).await?;
 
         let calls = assistant.tool_calls.clone().unwrap_or_default();
+        if recovering
+            && calls
+                .iter()
+                .any(|call| recovery_tools.contains(&call.function.name))
+        {
+            // Enforce the recovery restriction even if the model calls an omitted
+            // tool. Save a result for every call; execute none of this reply.
+            for call in &calls {
+                shared.commit(step as u32, Message::tool(
+                    call.id.clone(),
+                    "Error: no tools executed because this reply called a tool disabled during doom-loop recovery.",
+                )).await?;
+            }
+            return Err(Error::Run(format!(
+                "Stopped after {MAX_DOOM_LOOP_WARNINGS} doom-loop warnings: the model repeated a disabled tool during recovery"
+            )));
+        }
         if calls.is_empty() || last_step {
             let messages = std::mem::take(&mut *shared.conversation.lock().await);
             return Ok(RunOutcome {
@@ -508,6 +572,7 @@ async fn run_loop(
                 usage,
             });
         }
+        recovery_pending = false;
 
         let warnings_before = shared.doom.warnings();
         execute_calls(&shared, calls, limits, &token, step as u32).await?;
@@ -515,9 +580,16 @@ async fn run_loop(
         if shared.doom.warnings() == warnings_before {
             shared.doom.clear_warnings();
         } else if shared.doom.warnings() >= MAX_DOOM_LOOP_WARNINGS {
-            return Err(Error::Run(format!(
-                "Stopped after {MAX_DOOM_LOOP_WARNINGS} doom-loop warnings"
-            )));
+            if recovery_used {
+                return Err(Error::Run(format!(
+                    "Stopped after {MAX_DOOM_LOOP_WARNINGS} doom-loop warnings following a recovery attempt"
+                )));
+            }
+            recovery_tools = shared.doom.warned_tools();
+            shared.doom.clear_warnings();
+            recovery_used = true;
+            recovery_pending = true;
+            tracing::warn!(tools = ?recovery_tools, "doom-loop warning budget exhausted; attempting one recovery turn");
         }
     }
     unreachable!("the loop returns through the answer or an error")
@@ -811,7 +883,7 @@ async fn handle_call(
     });
     let mut output = call_tool(shared, call, token).await?;
     if repeats >= DOOM_LOOP_THRESHOLD {
-        shared.doom.warn();
+        shared.doom.warn(name);
         output.push_str(&format!(
             "\n\nYou have made this exact {name} call {repeats} times in your last {DOOM_LOOP_WINDOW} calls. Stop repeating it and try a different approach."
         ));
@@ -958,10 +1030,12 @@ mod tests {
             doom.record_call("filler");
         }
         assert_eq!(doom.record_call("k"), 1, "the window slides");
-        assert_eq!(doom.warn(), 1);
+        assert_eq!(doom.warn("echo"), 1);
         assert_eq!(doom.warnings(), 1);
+        assert!(doom.warned_tools().contains("echo"));
         doom.clear_warnings();
         assert_eq!(doom.warnings(), 0);
+        assert!(doom.warned_tools().is_empty());
     }
 
     #[test]

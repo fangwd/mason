@@ -10,9 +10,11 @@ surface for interrupts, streaming and shutdown is in [api.md](api.md).
   capped by explicit host limits) plus one final text-only call.
 - 4 concurrent leaf tool calls, shared with children; 16 tool calls and 4
   `task` calls per model reply.
-- A doom-loop detector warns on repeated identical calls (3 in the last 10)
-  and stops the run after three warnings without a clean step in between. A
-  warning adds two short lines on top of the output bound.
+- Identical tool calls warn on the third repetition in the last 10 calls.
+  Three warnings without a clean step trigger one recovery turn with the
+  offending tools disabled. Calling a disabled tool or reaching three warnings
+  again stops the run. Existing budgets and the final text-only turn still apply.
+  Warnings add two short lines beyond the output bound.
 - Root and child runs share a 1,000-tool-call budget and a 20,000,000-token
   budget (estimated input plus reported/estimated completion usage; not a
   billing guarantee).
