@@ -393,10 +393,24 @@ impl SessionStore for SqliteStore {
         if after > i64::MAX as u64 {
             return Ok(Vec::new());
         }
+        // An input enters its run as a message event naming it; the run's
+        // terminal event, if any, is its outcome.
         let rows = sqlx::query(
-            "SELECT id, key, source, delivery, content, created_at, consumed_at FROM input
-              WHERE session_id = ? AND id > ? ORDER BY id LIMIT ?",
+            "SELECT i.id, i.key, i.source, i.delivery, i.content, i.created_at, i.consumed_at, r.run_id,
+                    CASE WHEN r.run_id IS NULL THEN NULL
+                         ELSE COALESCE((SELECT substr(t.type, 5) FROM event t
+                                         WHERE t.run_id = r.run_id
+                                           AND t.type IN ('run.finished', 'run.failed', 'run.interrupted')
+                                         ORDER BY t.id LIMIT 1), 'running') END AS outcome
+               FROM input i
+               LEFT JOIN (SELECT json_extract(e.data, '$.inputId') AS input_id, MIN(e.run_id) AS run_id
+                            FROM event e
+                           WHERE e.session_id = ? AND e.type = 'message' AND e.run_id IS NOT NULL
+                             AND json_extract(e.data, '$.inputId') IS NOT NULL
+                           GROUP BY input_id) r ON r.input_id = i.id
+              WHERE i.session_id = ? AND i.id > ? ORDER BY i.id LIMIT ?",
         )
+        .bind(session_id as i64)
         .bind(session_id as i64)
         .bind(after as i64)
         .bind(i64::from(limit))
@@ -412,6 +426,8 @@ impl SessionStore for SqliteStore {
                     content: row.try_get("content")?,
                     created_at: timestamp(row.try_get::<i64, _>("created_at")?),
                     consumed_at: row.try_get::<Option<i64>, _>("consumed_at")?.map(timestamp),
+                    run_id: row.try_get("run_id")?,
+                    outcome: row.try_get("outcome")?,
                 })
             })
             .collect()
@@ -687,7 +703,7 @@ impl SessionStore for SqliteStore {
     }
 
     async fn recover(&self) -> Result<Recovery> {
-        let data = json!({"error": "the process restarted while this run was active"});
+        let data = json!({"error": super::RESTART_INTERRUPTED});
         let rows = sqlx::query(
             "INSERT INTO event (session_id, run_id, type, data, created_at)
              SELECT e.session_id, e.run_id, 'run.interrupted', ?, ?

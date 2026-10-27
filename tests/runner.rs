@@ -1378,3 +1378,123 @@ async fn a_running_subagent_is_announced_listed_and_interruptible() {
         json!({"answer": "parent done"})
     );
 }
+
+type Deliveries = Arc<tokio::sync::Mutex<Vec<(String, serde_json::Value)>>>;
+
+/// A webhook receiver: its url, and the (authorization, body) pairs it got.
+async fn webhook_receiver() -> (String, Deliveries) {
+    let received: Deliveries = Arc::default();
+    let hook = {
+        let received = received.clone();
+        axum::Router::new().route(
+            "/runs",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap,
+                      axum::Json(body): axum::Json<serde_json::Value>| {
+                    let received = received.clone();
+                    async move {
+                        let auth = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned();
+                        received.lock().await.push((auth, body));
+                    }
+                },
+            ),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/runs", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, hook).await });
+    (url, received)
+}
+
+async fn wait_for_deliveries(received: &Deliveries, count: usize) {
+    for _ in 0..100 {
+        if received.lock().await.len() >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the webhook got fewer than {count} deliveries");
+}
+
+#[tokio::test]
+async fn a_finished_run_reports_its_outcome_on_its_inputs_and_to_the_webhook() {
+    let (dir, store) = fixture().await;
+    let (url, received) = webhook_receiver().await;
+
+    let model = ScriptedModel::new(vec![answer("triaged")]);
+    let runner = Runner::new(agent(dir.path(), model), store.clone());
+    runner.notify_runs(mason::runner::RunWebhook {
+        url,
+        secret: Some("secret-token".into()),
+    });
+    let session = store
+        .create_session(NewSession {
+            metadata: json!({"site_id": 7}),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    store
+        .add_input(
+            session,
+            NewInput {
+                key: Some("issue-12".into()),
+                ..NewInput::queued("look at issue 12")
+            },
+        )
+        .await
+        .unwrap();
+    runner.wake(session);
+    wait_for_events(&store, session, "run.finished", 1).await;
+
+    let [input] = &store.list_inputs(session).await.unwrap()[..] else {
+        panic!("one input")
+    };
+    assert_eq!(input.outcome.as_deref(), Some("finished"));
+    let run_id = input.run_id.clone().expect("the run it entered");
+
+    wait_for_deliveries(&received, 1).await;
+    let received = received.lock().await;
+    let (auth, body) = &received[0];
+    assert_eq!(auth, "Bearer secret-token");
+    assert_eq!(body["type"], "run.finished");
+    assert_eq!(body["runId"], run_id.as_str());
+    assert_eq!(body["metadata"], json!({"site_id": 7}));
+    assert_eq!(body["inputs"], json!([{"id": input.id, "key": "issue-12"}]));
+    assert_eq!(body["data"], json!({"answer": "triaged"}));
+}
+
+#[tokio::test]
+async fn a_restart_reports_the_runs_it_found_abandoned_to_the_webhook() {
+    let (dir, store) = fixture().await;
+    let (url, received) = webhook_receiver().await;
+    let abandoned = store.create_session(NewSession::default()).await.unwrap();
+    let input_id = store
+        .add_input(abandoned, NewInput::queued("do the work"))
+        .await
+        .unwrap();
+    let claim = store.start_run(abandoned).await.unwrap();
+
+    let model = ScriptedModel::new(vec![]);
+    let runner = Runner::new(agent(dir.path(), model), store.clone());
+    runner.notify_runs(mason::runner::RunWebhook { url, secret: None });
+    let recovery = runner.recover_and_drain().await.unwrap();
+    assert_eq!(recovery.interrupted.len(), 1);
+
+    wait_for_deliveries(&received, 1).await;
+    let received = received.lock().await;
+    let (auth, body) = &received[0];
+    assert_eq!(auth, "", "no secret, no authorization header");
+    assert_eq!(body["type"], "run.interrupted");
+    assert_eq!(body["sessionId"], abandoned);
+    assert_eq!(body["runId"], claim.run_id.unwrap().as_str());
+    assert_eq!(body["inputs"], json!([{"id": input_id, "key": null}]));
+    assert_eq!(
+        body["data"],
+        json!({"error": "the process restarted while this run was active"})
+    );
+}

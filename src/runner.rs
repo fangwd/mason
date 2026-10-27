@@ -21,6 +21,17 @@ use crate::store::{Recovery, SessionId, SessionStore};
 /// they do not block the run.
 const DELTA_BUFFER: usize = 256;
 
+/// How long a run webhook delivery may take.
+const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Where a finished run is reported: a POST of its outcome, with `secret` as
+/// a bearer token when set.
+#[derive(Debug, Clone)]
+pub struct RunWebhook {
+    pub url: String,
+    pub secret: Option<String>,
+}
+
 /// Bounds root-session execution and admission; subagents retain their own fan-out limits.
 #[derive(Debug, Clone, Copy)]
 pub struct RunnerLimits {
@@ -76,13 +87,14 @@ pub struct Runner {
     store: Arc<dyn SessionStore>,
     sessions: Mutex<HashMap<SessionId, SessionHandle>>,
     deltas: Mutex<HashMap<SessionId, broadcast::Sender<Arc<RunEvent>>>>,
-    /// Background reviews of finished runs.
-    reviews: Mutex<Vec<JoinHandle<()>>>,
+    /// Background reviews and webhook deliveries of finished runs.
+    background: Mutex<Vec<JoinHandle<()>>>,
     /// Serializes reflections and consolidations.
     maintenance: tokio::sync::Mutex<()>,
     /// When each stored session was last reflected on, within the cooldown.
     reflected: Mutex<HashMap<SessionId, Instant>>,
     shutdown: CancellationToken,
+    webhook: std::sync::OnceLock<RunWebhook>,
 }
 
 impl Runner {
@@ -105,11 +117,81 @@ impl Runner {
             store,
             sessions: Mutex::new(HashMap::new()),
             deltas: Mutex::new(HashMap::new()),
-            reviews: Mutex::new(Vec::new()),
+            background: Mutex::new(Vec::new()),
             maintenance: tokio::sync::Mutex::new(()),
             reflected: Mutex::new(HashMap::new()),
             shutdown: CancellationToken::new(),
+            webhook: std::sync::OnceLock::new(),
         }))
+    }
+
+    /// Reports every finished, failed or interrupted top-level run to `webhook`.
+    pub fn notify_runs(&self, webhook: RunWebhook) {
+        let _ = self.webhook.set(webhook);
+    }
+
+    /// Posts a run's outcome - its type, data, the inputs it consumed and the
+    /// session's metadata - to the webhook, if one is set. Best effort: a failed
+    /// delivery is logged, and the inbox (`runId`, `outcome`) stays the record.
+    /// Shutdown waits for pending deliveries within its grace.
+    fn report_run(
+        &self,
+        session_id: SessionId,
+        run_id: &str,
+        event_type: &str,
+        data: serde_json::Value,
+    ) {
+        let Some(webhook) = self.webhook.get().cloned() else {
+            return;
+        };
+        let store = self.store.clone();
+        let run_id = run_id.to_owned();
+        let event_type = event_type.to_owned();
+        let delivery = tokio::spawn(async move {
+            let inputs: Vec<_> = store
+                .list_inputs(session_id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|input| input.run_id.as_deref() == Some(run_id.as_str()))
+                .map(|input| json!({"id": input.id, "key": input.key}))
+                .collect();
+            let metadata = match store.get_session(session_id).await {
+                Ok(Some(session)) => session.metadata,
+                _ => serde_json::Value::Null,
+            };
+            let body = json!({
+                "type": event_type,
+                "sessionId": session_id,
+                "runId": run_id,
+                "inputs": inputs,
+                "metadata": metadata,
+                "data": data,
+            });
+            let mut request = reqwest::Client::new()
+                .post(&webhook.url)
+                .timeout(WEBHOOK_TIMEOUT)
+                .json(&body);
+            if let Some(secret) = &webhook.secret {
+                request = request.bearer_auth(secret);
+            }
+            let sent = request
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status);
+            if let Err(err) = sent {
+                tracing::warn!(
+                    "cannot report run {run_id} of session {session_id} to the webhook: {err}"
+                );
+            }
+        });
+        self.track(delivery);
+    }
+
+    fn track(&self, task: JoinHandle<()>) {
+        let mut background = self.background.lock().expect("background mutex");
+        background.retain(|task| !task.is_finished());
+        background.push(task);
     }
 
     pub fn store(&self) -> &Arc<dyn SessionStore> {
@@ -316,9 +398,18 @@ impl Runner {
         tx
     }
 
-    /// Recovers abandoned runs before draining pending inputs.
+    /// Recovers abandoned runs, reporting each as interrupted, before draining
+    /// pending inputs.
     pub async fn recover_and_drain(self: &Arc<Self>) -> Result<Recovery> {
         let recovery = self.store.recover().await?;
+        for (session_id, run_id) in &recovery.interrupted {
+            self.report_run(
+                *session_id,
+                run_id,
+                "run.interrupted",
+                json!({"error": crate::store::RESTART_INTERRUPTED}),
+            );
+        }
         for session_id in self.store.pending_sessions().await? {
             if self.try_wake(session_id).is_err() {
                 break;
@@ -398,9 +489,7 @@ impl Runner {
                 tracing::warn!("memory consolidation failed: {err}");
             }
         });
-        let mut reviews = self.reviews.lock().expect("reviews mutex");
-        reviews.retain(|task| !task.is_finished());
-        reviews.push(task);
+        self.track(task);
     }
 
     /// Whether the session was reflected on within [`reflect::REFLECTION_COOLDOWN`].
@@ -419,25 +508,27 @@ impl Runner {
     }
 
     /// Stops new work, cancels runs and reviews, and allows bounded cleanup
-    /// before aborting stragglers.
+    /// before aborting stragglers. The background work the ending runs spawn
+    /// (their interruption reports) is waited for after them.
     pub async fn shutdown(&self, grace: Duration) {
         let handles: Vec<SessionHandle> = {
             let mut sessions = self.sessions.lock().expect("the runner mutex is poisoned");
             self.shutdown.cancel();
             sessions.drain().map(|(_, handle)| handle).collect()
         };
-        let reviews: Vec<JoinHandle<()>> = self
-            .reviews
+        let deadline = Instant::now() + grace;
+        for mut task in handles.into_iter().filter_map(|handle| handle.task) {
+            if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+                task.abort();
+            }
+        }
+        let background: Vec<JoinHandle<()>> = self
+            .background
             .lock()
-            .expect("reviews mutex")
+            .expect("background mutex")
             .drain(..)
             .collect();
-        let deadline = Instant::now() + grace;
-        let tasks = handles
-            .into_iter()
-            .filter_map(|handle| handle.task)
-            .chain(reviews);
-        for mut task in tasks {
+        for mut task in background {
             if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
                 task.abort();
             }
@@ -524,11 +615,12 @@ async fn drain(runner: Arc<Runner>, session_id: SessionId, token: CancellationTo
         };
         if let Err(err) = runner
             .store
-            .append_run_event(session_id, &run_id, event_type, data)
+            .append_run_event(session_id, &run_id, event_type, data.clone())
             .await
         {
             tracing::error!("agent session {session_id}: cannot record {event_type}: {err}");
         }
+        runner.report_run(session_id, &run_id, event_type, data);
         if event_type != "run.interrupted"
             && (runner.agent.memory().is_some() || runner.agent.has_evaluator())
         {

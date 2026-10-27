@@ -945,7 +945,6 @@ impl AgentSpec {
         });
         let builder = crate::Agent::builder()
             .tools_shared(builtin)
-            .tools_shared(mcp_tools)
             .limits(self.limits.clone())
             .spill(spill)
             .shell_timeouts(self.shell_timeouts.0, self.shell_timeouts.1)
@@ -966,6 +965,7 @@ impl AgentSpec {
             Backend::Vendors(vendors) => builder.vendors(vendors),
             Backend::Model(model) => builder.model(model),
         };
+        builder = self.with_mcp_tools(builder, mcp_tools)?;
         if let Some(instructions) = &self.instructions {
             builder = builder.instructions(instructions.clone());
         }
@@ -1038,6 +1038,32 @@ impl AgentSpec {
             }
         }
         Ok(configs)
+    }
+
+    /// The discovered MCP tools, listed again by every top-level run so a server's
+    /// changed tools need no restart.
+    fn with_mcp_tools(
+        &self,
+        builder: AgentBuilder,
+        tools: Vec<Arc<dyn crate::tool::Tool>>,
+    ) -> Result<AgentBuilder> {
+        #[cfg(feature = "mcp")]
+        if self.has_mcp() && self.allow_mcp {
+            let configs = self.mcp_configs()?;
+            let (mode, network) = (self.execution_mode, self.allow_network);
+            let refresh: crate::agent::ToolRefresh = Arc::new(move || {
+                let configs = configs.clone();
+                Box::pin(async move {
+                    let servers = crate::mcp::McpServers::connect(&configs, mode, network).await;
+                    match servers.failures() {
+                        [] => Ok(servers.tools()),
+                        failures => Err(failures.join("; ")),
+                    }
+                })
+            });
+            return Ok(builder.refreshing_tools(tools, refresh));
+        }
+        Ok(builder.tools_shared(tools))
     }
 
     async fn discover_mcp(&self) -> Result<Vec<Arc<dyn crate::tool::Tool>>> {

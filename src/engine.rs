@@ -293,6 +293,9 @@ struct RunShared {
     /// Spill files of oversized tool results, by tool call id; the view is
     /// rebuilt every step but each result is saved once.
     spilled: StdMutex<HashMap<String, PathBuf>>,
+    /// Files this run wrote or edited, relative to the working directory, for
+    /// the profile's before-finish checks.
+    edited: StdMutex<std::collections::BTreeSet<String>>,
 }
 
 impl RunShared {
@@ -427,7 +430,9 @@ async fn run_loop(
         persist,
         run_id,
         spilled: StdMutex::new(HashMap::new()),
+        edited: StdMutex::new(Default::default()),
     });
+    let mut finish_checks = 0;
     let mut usage: Option<Usage> = None;
     let run_budget = shared.ctx.budget.clone().expect("run budget");
     // Leaves the final text-only turn time to answer before the hard deadline.
@@ -564,6 +569,27 @@ async fn run_loop(
                 "Stopped after {MAX_DOOM_LOOP_WARNINGS} doom-loop warnings: the model repeated a disabled tool during recovery"
             )));
         }
+        if (calls.is_empty() || last_step)
+            && let Some(failures) = before_finish(&shared).await?
+        {
+            // no turn left to repair in, or the repairs are spent: the run did not succeed
+            if last_step || finish_checks == MAX_FINISH_CHECKS {
+                return Err(Error::Run(format!(
+                    "the profile's before-finish checks still fail:\n\n{failures}"
+                )));
+            }
+            finish_checks += 1;
+            shared
+                .commit(
+                    step as u32,
+                    Message::user(format!(
+                        "[Mason runtime check] This profile checks edited files before a run \
+                         may finish, and some checks failed:\n\n{failures}\n\nFix them, then finish."
+                    )),
+                )
+                .await?;
+            continue;
+        }
         if calls.is_empty() || last_step {
             let messages = std::mem::take(&mut *shared.conversation.lock().await);
             return Ok(RunOutcome {
@@ -593,6 +619,134 @@ async fn run_loop(
         }
     }
     unreachable!("the loop returns through the answer or an error")
+}
+
+/// How often a run that tries to finish is sent back to fix failed checks.
+const MAX_FINISH_CHECKS: usize = 3;
+
+/// Runs a profile hook on one edited file: whether it passed, and its output.
+async fn run_hook(
+    shared: &RunShared,
+    hook: &crate::profile::Hook,
+    path: &str,
+) -> Result<(bool, String)> {
+    // an interrupt or the run deadline ends a hook like any step: after the
+    // cleanup grace an ordinary call gets
+    let call = hook_call(shared, hook, path);
+    tokio::pin!(call);
+    tokio::select! {
+        result = &mut call => result,
+        () = shared.ctx.token.cancelled() => {
+            let _ = tokio::time::timeout(CLEANUP_GRACE, &mut call).await;
+            Err(Error::Cancelled)
+        }
+    }
+}
+
+async fn hook_call(
+    shared: &RunShared,
+    hook: &crate::profile::Hook,
+    path: &str,
+) -> Result<(bool, String)> {
+    let Some(tool) = shared.tools.get(&hook.tool) else {
+        return Ok((
+            false,
+            format!("the {} tool is not available to this run", hook.tool),
+        ));
+    };
+    // the authorization an ordinary call of the tool would get; the call budget
+    // bounds the model, not the checks the profile makes of its edits
+    let args = hook.args_for(path);
+    let ctx = &shared.ctx;
+    if let Err(err) = ctx.policy.authorize(&hook.tool, &args, ctx).await {
+        return match err {
+            ToolError::Failure(message) => Ok((false, format!("permission denied: {message}"))),
+            ToolError::Fatal(err) => Err(err),
+        };
+    }
+    if let Some(denied) = ctx
+        .rules
+        .as_ref()
+        .and_then(|rules| rules.check(&hook.tool, &args, &ctx.cwd))
+    {
+        return Ok((false, format!("permission denied: {denied}")));
+    }
+    // a run cancelled while the call waited for approval starts no tool in its grace
+    if ctx.token.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    match tool.call(args, ctx).await {
+        Ok(output) => Ok((true, output)),
+        Err(ToolError::Failure(message)) => Ok((false, message)),
+        Err(ToolError::Fatal(err)) => Err(err),
+    }
+}
+
+/// The failed before-finish checks of the files this run edited, if any failed.
+async fn before_finish(shared: &RunShared) -> Result<Option<String>> {
+    let Some(rules) = shared.ctx.rules.clone() else {
+        return Ok(None);
+    };
+    let edited: Vec<String> = shared
+        .edited
+        .lock()
+        .expect("edited files")
+        .iter()
+        .cloned()
+        .collect();
+    let mut failures = Vec::new();
+    for hook in &rules.hooks.before_finish {
+        for path in edited
+            .iter()
+            .filter(|path| crate::profile::glob_match(&hook.pattern, path))
+        {
+            // a finish check is a leaf call: it takes a slot of the shared concurrency
+            // limit, as an after-edit check runs in the slot of its edit
+            let _permit = match &shared.ctx.budget {
+                Some(budget) => Some(tokio::select! {
+                    permit = budget.tool_slots.acquire() => permit.expect("tool semaphore stays open"),
+                    () = shared.ctx.token.cancelled() => return Err(Error::Cancelled),
+                }),
+                None => None,
+            };
+            let (passed, output) = run_hook(shared, hook, path).await?;
+            if !passed {
+                failures.push(format!("{} on {path}:\n{output}", hook.tool));
+            }
+        }
+    }
+    let failures = shared
+        .ctx
+        .spill
+        .truncate(&failures.join("\n\n"), Keep::Head)
+        .await
+        .map_err(|err| match err {
+            ToolError::Fatal(err) => err,
+            ToolError::Failure(message) => Error::Run(message),
+        })?;
+    Ok((!failures.is_empty()).then_some(failures))
+}
+
+/// The after-edit hook results for a file a `write` or `edit` just changed.
+async fn after_edit(shared: &RunShared, path: &str) -> Result<String> {
+    let Some(rules) = shared.ctx.rules.clone() else {
+        return Ok(String::new());
+    };
+    let mut notes = String::new();
+    for hook in rules
+        .hooks
+        .after_edit
+        .iter()
+        .filter(|hook| crate::profile::glob_match(&hook.pattern, path))
+    {
+        let (passed, output) = run_hook(shared, hook, path).await?;
+        let verdict = if passed { "passed" } else { "FAILED" };
+        notes.push_str(&format!(
+            "\n\n[{} on {path} after this edit: {verdict}]\n{output}",
+            hook.tool
+        ));
+    }
+    Ok(notes)
 }
 
 /// The messages to send: stale reasoning stripped and, when over budget, old tool
@@ -946,12 +1100,34 @@ async fn call_tool(
             }
         }
     }
+    if let Some(rules) = &ctx.rules
+        && let Some(denied) = rules.check(name, &args, &ctx.cwd)
+    {
+        return Ok(format!("Error: permission denied: {denied}"));
+    }
+    let edited = matches!(name.as_str(), "write" | "edit")
+        .then(|| args.get("filePath").and_then(Value::as_str))
+        .flatten()
+        .map(str::to_owned);
     match tool.call(args, &ctx).await {
-        Ok(output) => match shared.ctx.spill.truncate(&output, Keep::Head).await {
-            Ok(text) => Ok(text),
-            Err(ToolError::Failure(message)) => Ok(format!("Error: {message}")),
-            Err(ToolError::Fatal(err)) => Err(err),
-        },
+        Ok(mut output) => {
+            // the file the write changed, so hooks match it whatever alias reached it
+            if let Some(path) =
+                edited.and_then(|path| crate::profile::written_file(&ctx.cwd, &path))
+            {
+                shared
+                    .edited
+                    .lock()
+                    .expect("edited files")
+                    .insert(path.clone());
+                output.push_str(&after_edit(shared, &path).await?);
+            }
+            match shared.ctx.spill.truncate(&output, Keep::Head).await {
+                Ok(text) => Ok(text),
+                Err(ToolError::Failure(message)) => Ok(format!("Error: {message}")),
+                Err(ToolError::Fatal(err)) => Err(err),
+            }
+        }
         Err(ToolError::Failure(message)) => {
             if token.is_cancelled() {
                 // Cancellation wins over the tool's own error report.

@@ -40,11 +40,18 @@ impl ServerHandler for Fixture {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        // after a "code change" (the marker file), `late` appears and `echo` is redescribed
+        let changed = std::env::var_os("MASON_FIXTURE_LATE_TOOL")
+            .is_some_and(|marker| std::path::Path::new(&marker).exists());
         Ok(ListToolsResult {
             tools: vec![
                 Tool::new(
                     "echo",
-                    "Echoes the text",
+                    if changed {
+                        "Echoes the text, v2"
+                    } else {
+                        "Echoes the text"
+                    },
                     object_schema(
                         json!({"text": {"type": "string"}, "times": {"type": "integer"}}),
                         &["text"],
@@ -56,7 +63,11 @@ impl ServerHandler for Fixture {
                     "Returns structured content",
                     object_schema(json!({}), &[]),
                 ),
-            ],
+            ]
+            .into_iter()
+            // a tool that appears once its marker file exists, as after a code change
+            .chain(changed.then(|| Tool::new("late", "Added later", object_schema(json!({}), &[]))))
+            .collect(),
             ..Default::default()
         })
     }
@@ -68,6 +79,7 @@ impl ServerHandler for Fixture {
     ) -> Result<CallToolResponse, ErrorData> {
         let arguments = request.arguments.clone().unwrap_or_default();
         match request.name.as_ref() {
+            "late" => Ok(CallToolResult::success(vec![ContentBlock::text("late")]).into()),
             "echo" => {
                 let text = arguments
                     .get("text")

@@ -28,6 +28,19 @@ use crate::skill::{Skill, SkillTool, load_skills, skills_entries};
 use crate::store::{Delivery, NewSession, Session, SessionId, SessionStore};
 use crate::tool::{OutputSpill, Tool, ToolCtx, ToolScope, Toolset};
 
+/// Lists a refreshable tool source's tools again (MCP servers): each top-level
+/// run asks, so a server's new or changed tools reach the next run without a
+/// restart. An error keeps the tools the source had at build.
+pub type ToolRefresh = Arc<
+    dyn Fn() -> Pin<
+            Box<
+                dyn std::future::Future<Output = std::result::Result<Vec<Arc<dyn Tool>>, String>>
+                    + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
 /// A stored session's background processes and MCP connections are closed
 /// after this long without a run.
 pub const SESSION_SCOPE_IDLE: Duration = Duration::from_secs(30 * 60);
@@ -57,6 +70,8 @@ struct AgentInner {
     allow_network: bool,
     policy: Option<Arc<dyn crate::tool::policy::ToolPolicy>>,
     scopes: Arc<SessionScopes>,
+    /// The refreshable source and the names its tools had at build.
+    refresh: Option<(ToolRefresh, Vec<String>)>,
 }
 
 impl AgentInner {
@@ -81,22 +96,42 @@ impl AgentInner {
         skills
     }
 
-    /// Loads the skills and the memory index a top-level run and its children share.
-    async fn snapshot(&self) -> Arc<RunSnapshot> {
+    /// Loads the skills, the memory index and the refreshed tools a top-level run
+    /// and its children share.
+    async fn snapshot(&self, token: &CancellationToken) -> Arc<RunSnapshot> {
+        // each server's connect timeout bounds the listing; an interrupt ends it
+        let refreshed = match &self.refresh {
+            Some((refresh, _)) => match tokio::select! {
+                listed = refresh() => listed,
+                () = token.cancelled() => Err("the run was cancelled".to_owned()),
+            } {
+                Ok(tools) => Some(tools),
+                Err(error) => {
+                    tracing::warn!("keeping the tools listed at startup: {error}");
+                    None
+                }
+            },
+            None => None,
+        };
         Arc::new(RunSnapshot {
             skills: self.skills().await,
             memory: match &self.memory {
                 Some(memory) => memory.index().await,
                 None => Vec::new(),
             },
+            refreshed,
         })
     }
 }
 
-/// Skills and the memory index, snapshotted per top-level run.
+/// Skills, the memory index and refreshed tools, snapshotted per top-level run.
+#[derive(Default)]
 struct RunSnapshot {
     skills: Vec<Skill>,
     memory: Vec<MemoryEntry>,
+    /// The refreshable source's tools as listed for this run; `None` keeps the
+    /// build-time ones.
+    refreshed: Option<Vec<Arc<dyn Tool>>>,
 }
 
 /// Tool scopes of stored sessions, kept between their runs until idle.
@@ -214,6 +249,7 @@ struct Assembled {
     tools: Arc<Toolset>,
     system: String,
     limits: Limits,
+    rules: Arc<crate::profile::Rules>,
 }
 
 impl Agent {
@@ -275,7 +311,7 @@ impl Agent {
 
         // Share prompt, skill and memory snapshots with child runs.
         let prompts = inner.prompts.load()?;
-        let snapshot = inner.snapshot().await;
+        let snapshot = inner.snapshot(&token).await;
         let usable = crate::context::usable_tokens(inner.model.context_tokens())?;
 
         let launch: LaunchSubagent = Arc::new({
@@ -309,7 +345,7 @@ impl Agent {
                 model: inner.model.clone(),
                 tools: assembled.tools,
                 prompts,
-                ctx,
+                ctx: ctx.with_rules(assembled.rules.clone()),
                 limits: assembled.limits,
                 messages,
                 run_id: None,
@@ -360,7 +396,7 @@ impl Agent {
         }
         // Share prompt, skill and memory snapshots with child runs.
         let prompts = inner.prompts.load()?;
-        let snapshot = inner.snapshot().await;
+        let snapshot = inner.snapshot(&run.token).await;
         let usable = usable_tokens(inner.model.context_tokens())?;
         run_saved(
             &inner,
@@ -693,6 +729,11 @@ async fn run_saved(
     // A root run keeps the session's processes and MCP connections for its next
     // message; a child session never gets one, so its run owns its scope.
     let lease = steer.then(|| inner.scopes.acquire(session_id));
+    // the session's servers older than this run's tools start again, before any call
+    #[cfg(feature = "mcp")]
+    if let (Some(lease), Some(listed)) = (&lease, &snapshot.refreshed) {
+        crate::mcp::close_outdated(&lease.scope, listed).await;
+    }
     let mut ctx = tool_context(inner)
         .with_spill(inner.spill.clone())
         .with_execution(
@@ -762,7 +803,7 @@ async fn run_saved(
             model: inner.model.clone(),
             tools: assembled.tools,
             prompts: prompts.clone(),
-            ctx,
+            ctx: ctx.with_rules(assembled.rules.clone()),
             limits: assembled.limits,
             messages,
             run_id: Some(run_id.to_owned()),
@@ -979,11 +1020,23 @@ fn assemble(
     launch: Option<LaunchSubagent>,
 ) -> Result<Assembled> {
     let mut tools = Toolset::new();
+    // build-time tools, minus the refreshed source's, which this run lists afresh
+    let replaced: &[String] = match (&inner.refresh, &snapshot.refreshed) {
+        (Some((_, names)), Some(_)) => names,
+        _ => &[],
+    };
     for name in inner.tools.names() {
-        if profile.allows(name)
+        if !replaced.iter().any(|replaced| replaced == name)
             && let Some(tool) = inner.tools.get(name)
+            && profile.admits(name, tool.read_only())
         {
             tools.push_shared(tool)?;
+        }
+    }
+    for tool in snapshot.refreshed.iter().flatten() {
+        let name = tool.spec().function.name;
+        if profile.admits(&name, tool.read_only()) && tools.get(&name).is_none() {
+            tools.push_shared(tool.clone())?;
         }
     }
     if !snapshot.skills.is_empty() && profile.allows("skill") {
@@ -1046,6 +1099,7 @@ fn assemble(
         tools: Arc::new(tools),
         system: sections.join("\n\n"),
         limits,
+        rules: Arc::new(profile.rules.clone()),
     })
 }
 
@@ -1079,7 +1133,7 @@ async fn run_child(
             model: inner.model.clone(),
             tools: assembled.tools,
             prompts,
-            ctx,
+            ctx: ctx.with_rules(assembled.rules.clone()),
             limits: assembled.limits,
             messages,
             run_id: None,
@@ -1125,6 +1179,7 @@ pub struct AgentBuilder {
     execution_mode: crate::tool::policy::ExecutionMode,
     allow_network: bool,
     policy: Option<Arc<dyn crate::tool::policy::ToolPolicy>>,
+    refresh: Option<(ToolRefresh, Vec<String>)>,
 }
 
 impl AgentBuilder {
@@ -1171,6 +1226,16 @@ impl AgentBuilder {
     /// Registers shared tools (e.g. the MCP connections' adapters).
     pub fn tools_shared(mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) -> Self {
         self.shared_tools.extend(tools);
+        self
+    }
+
+    /// Registers a tool source whose tools can change while the agent runs (MCP
+    /// servers): `tools` as listed now, which profiles are validated against,
+    /// and `refresh`, which every top-level run calls for the current list.
+    pub fn refreshing_tools(mut self, tools: Vec<Arc<dyn Tool>>, refresh: ToolRefresh) -> Self {
+        let names = tools.iter().map(|tool| tool.spec().function.name).collect();
+        self.shared_tools.extend(tools);
+        self.refresh = Some((refresh, names));
         self
     }
 
@@ -1384,6 +1449,7 @@ impl AgentBuilder {
                 allow_network: self.allow_network,
                 policy: self.policy,
                 scopes: Arc::default(),
+                refresh: self.refresh,
             }),
         })
     }
@@ -1619,5 +1685,116 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(err.to_string().contains("no/such/prompts.yaml"), "{err}");
+    }
+
+    /// A tool named and described as given.
+    struct Listed(&'static str, &'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for Listed {
+        fn spec(&self) -> crate::llm::ToolSpec {
+            crate::llm::ToolSpec::function(self.0, self.1, serde_json::json!({"type": "object"}))
+        }
+        async fn call(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> std::result::Result<String, crate::tool::ToolError> {
+            Ok(String::new())
+        }
+    }
+
+    /// A model that records the tools of each request it is sent.
+    struct ToolsSeen(StdMutex<Vec<Vec<String>>>);
+
+    #[async_trait::async_trait]
+    impl ChatModel for ToolsSeen {
+        fn context_tokens(&self) -> usize {
+            128_000
+        }
+
+        async fn stream(
+            &self,
+            request: ChatRequest,
+            _token: &CancellationToken,
+        ) -> Result<ChatStream> {
+            self.0.lock().unwrap().push(
+                request
+                    .tools
+                    .iter()
+                    .map(|tool| format!("{}: {}", tool.function.name, tool.function.description))
+                    .collect(),
+            );
+            Ok(stream::iter([
+                Ok(ChatDelta::Text("done".into())),
+                Ok(ChatDelta::Done {
+                    finish_reason: Some("stop".into()),
+                }),
+            ])
+            .boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn each_run_lists_a_refreshing_source_s_tools_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = Arc::new(ToolsSeen(StdMutex::new(Vec::new())));
+        let listings = Arc::new(StdMutex::new(vec![
+            // a failed listing keeps the tools from build
+            Err("server down".to_owned()),
+            Ok(vec!["srv_query: v2", "srv_scrape: new"]),
+        ]));
+        let refresh: ToolRefresh = Arc::new(move || {
+            let next = listings.lock().unwrap().remove(0);
+            Box::pin(async move {
+                next.map(|names| {
+                    names
+                        .into_iter()
+                        .map(|entry| {
+                            let (name, description) = entry.split_once(": ").unwrap();
+                            Arc::new(Listed(name, description)) as Arc<dyn Tool>
+                        })
+                        .collect()
+                })
+            })
+        });
+        let agent = Agent::builder()
+            .model(model.clone())
+            .cwd(dir.path())
+            .spill(Arc::new(OutputSpill::new(dir.path().join("spill"))))
+            .refreshing_tools(vec![Arc::new(Listed("srv_query", "v1"))], refresh)
+            .build()
+            .unwrap();
+        agent.run_once("first").await.unwrap();
+        agent.run_once("second").await.unwrap();
+
+        let seen = model.0.lock().unwrap();
+        let srv = |tools: &Vec<String>| {
+            tools
+                .iter()
+                .filter(|t| t.starts_with("srv_"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(srv(&seen[0]), ["srv_query: v1"]);
+        assert_eq!(srv(&seen[1]), ["srv_query: v2", "srv_scrape: new"]);
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_does_not_wait_for_a_hung_tool_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let refresh: ToolRefresh = Arc::new(|| Box::pin(std::future::pending()));
+        let agent = Agent::builder()
+            .model(Arc::new(AnswerModel("x".into())))
+            .cwd(dir.path())
+            .spill(Arc::new(OutputSpill::new(dir.path().join("spill"))))
+            .refreshing_tools(Vec::new(), refresh)
+            .build()
+            .unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        let run = agent.run_prompt_as_with_token("build", "go", None, token);
+        let result = tokio::time::timeout(Duration::from_secs(5), run).await;
+        assert!(result.expect("the interrupt ends the listing").is_err());
     }
 }

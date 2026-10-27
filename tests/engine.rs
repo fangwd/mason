@@ -1083,3 +1083,611 @@ async fn a_hung_steer_callback_cannot_outlive_the_run_deadline() {
         "the deadline bounded the hung steer pull: {elapsed:?}"
     );
 }
+
+/// Passes when the file at `path` says "ok", as a crawler check would on a fixed file.
+struct CheckTool;
+
+#[async_trait::async_trait]
+impl mason::Tool for CheckTool {
+    fn spec(&self) -> mason::ToolSpec {
+        mason::ToolSpec::function(
+            "check",
+            "checks a file",
+            serde_json::json!({"type": "object"}),
+        )
+    }
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &mason::ToolCtx,
+    ) -> std::result::Result<String, mason::ToolError> {
+        let path = args["path"].as_str().unwrap_or_default();
+        let text = std::fs::read_to_string(ctx.cwd.join(path)).unwrap_or_default();
+        if text.contains("ok") {
+            Ok(format!("{path} is ok"))
+        } else {
+            Err(mason::ToolError::Failure(format!("{path} is broken")))
+        }
+    }
+}
+
+fn rules(shell: Option<&[&str]>, write_paths: Option<&[&str]>) -> mason::Rules {
+    let hook = mason::Hook {
+        pattern: "crawlers/*.ts".into(),
+        tool: "check".into(),
+        args: serde_json::from_value(serde_json::json!({"path": "{path}"})).unwrap(),
+    };
+    mason::Rules {
+        shell: shell.map(|list| list.iter().map(|s| s.to_string()).collect()),
+        write_paths: write_paths.map(|list| list.iter().map(|s| s.to_string()).collect()),
+        hooks: mason::Hooks {
+            after_edit: vec![hook.clone()],
+            before_finish: vec![hook],
+        },
+    }
+}
+
+#[tokio::test]
+async fn hooks_check_each_edit_and_hold_the_finish_until_checks_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = builtin_tools();
+    tools.push(Box::new(CheckTool));
+    let (mut config, model) = config(
+        vec![
+            call(
+                "write",
+                r#"{"filePath":"crawlers/shop.ts","content":"bad"}"#,
+            ),
+            answer("done"),
+            call(
+                "write",
+                r#"{"filePath":"crawlers/shop.ts","content":"ok now"}"#,
+            ),
+            answer("done"),
+        ],
+        tools,
+        dir.path(),
+    )
+    .await;
+    config.ctx = config.ctx.with_rules(Arc::new(rules(None, None)));
+    let outcome = engine::run(config).await.unwrap();
+    assert_eq!(outcome.answer, "done");
+    let results = tool_results(&outcome.messages);
+    assert!(
+        results[0].contains(
+            "[check on crawlers/shop.ts after this edit: FAILED]\ncrawlers/shop.ts is broken"
+        ),
+        "{}",
+        results[0]
+    );
+    assert!(
+        results[1].contains("after this edit: passed"),
+        "{}",
+        results[1]
+    );
+    // the first "done" was sent back with the failed check
+    let requests = model.requests();
+    let sent_back = requests[2]
+        .messages
+        .last()
+        .unwrap()
+        .content
+        .clone()
+        .unwrap_or_default();
+    assert!(
+        sent_back.contains("[Mason runtime check]")
+            && sent_back.contains("check on crawlers/shop.ts:\ncrawlers/shop.ts is broken"),
+        "{sent_back}"
+    );
+    assert_eq!(model.request_count(), 4);
+}
+
+#[tokio::test]
+async fn profile_rules_keep_bash_and_writes_to_what_they_allow() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = builtin_tools();
+    tools.push(Box::new(CheckTool));
+    let (mut config, _) = config(
+        vec![
+            calls(vec![
+                (
+                    "1".into(),
+                    "bash".into(),
+                    r#"{"command":"git status"}"#.into(),
+                ),
+                (
+                    "2".into(),
+                    "bash".into(),
+                    r#"{"command":"git status; rm -rf x"}"#.into(),
+                ),
+                (
+                    "3".into(),
+                    "bash".into(),
+                    r#"{"command":"cat secrets"}"#.into(),
+                ),
+                (
+                    "4".into(),
+                    "write".into(),
+                    r#"{"filePath":"src/core.ts","content":"x"}"#.into(),
+                ),
+                (
+                    "5".into(),
+                    "write".into(),
+                    r#"{"filePath":"crawlers/../src/core.ts","content":"x"}"#.into(),
+                ),
+                (
+                    "6".into(),
+                    "write".into(),
+                    r#"{"filePath":"notes/a.md","content":"x"}"#.into(),
+                ),
+            ]),
+            answer("done"),
+        ],
+        tools,
+        dir.path(),
+    )
+    .await;
+    std::process::Command::new("git")
+        .arg("init")
+        .arg("-q")
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    config.ctx = config.ctx.with_rules(Arc::new(mason::Rules {
+        hooks: Default::default(),
+        ..rules(Some(&["git status*"]), Some(&["crawlers/*", "notes/*"]))
+    }));
+    let outcome = engine::run(config).await.unwrap();
+    // parallel calls commit as they finish: read each result by its call id
+    let by_id = |id: &str| {
+        outcome
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(id))
+            .and_then(|message| message.content.clone())
+            .unwrap_or_default()
+    };
+    let results: Vec<String> = ["1", "2", "3", "4", "5", "6"]
+        .iter()
+        .map(|id| by_id(id))
+        .collect();
+    assert!(!results[0].starts_with("Error"), "{}", results[0]);
+    assert!(
+        results[1].contains("without chaining or redirection"),
+        "{}",
+        results[1]
+    );
+    assert!(
+        results[2].contains("this profile's shell allows only: git status*"),
+        "{}",
+        results[2]
+    );
+    assert!(
+        results[3].contains("this profile may change only: crawlers/*, notes/*"),
+        "{}",
+        results[3]
+    );
+    assert!(results[4].contains("may change only"), "{}", results[4]);
+    assert!(!results[5].starts_with("Error"), "{}", results[5]);
+    assert!(!dir.path().join("src/core.ts").exists());
+}
+
+#[tokio::test]
+async fn failing_checks_fail_the_run_once_repairs_are_spent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = builtin_tools();
+    tools.push(Box::new(CheckTool));
+    let mut replies = vec![call(
+        "write",
+        r#"{"filePath":"crawlers/shop.ts","content":"bad"}"#,
+    )];
+    replies.extend((0..4).map(|_| answer("done")));
+    let (mut config, model) = config(replies, tools, dir.path()).await;
+    config.ctx = config.ctx.with_rules(Arc::new(rules(None, None)));
+    let err = engine::run(config).await.unwrap_err();
+    assert!(
+        err.to_string().contains("before-finish checks still fail"),
+        "{err}"
+    );
+    assert_eq!(
+        model.request_count(),
+        5,
+        "the edit, then three repairs and a final refusal"
+    );
+}
+
+#[tokio::test]
+async fn the_final_turn_cannot_skip_failing_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = builtin_tools();
+    tools.push(Box::new(CheckTool));
+    let (mut config, _) = config(
+        vec![
+            call(
+                "write",
+                r#"{"filePath":"crawlers/shop.ts","content":"bad"}"#,
+            ),
+            answer("out of steps"),
+        ],
+        tools,
+        dir.path(),
+    )
+    .await;
+    config.limits.max_steps = 1;
+    config.ctx = config.ctx.with_rules(Arc::new(rules(None, None)));
+    let err = engine::run(config).await.unwrap_err();
+    assert!(
+        err.to_string().contains("before-finish checks still fail"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn hooks_get_the_authorization_of_an_ordinary_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let hook = mason::Hook {
+        pattern: "notes/*".into(),
+        tool: "write".into(),
+        args: serde_json::from_value(serde_json::json!({"filePath": "secret/x", "content": "x"}))
+            .unwrap(),
+    };
+    let (mut config, _) = config(
+        vec![
+            call("write", r#"{"filePath":"notes/a.md","content":"x"}"#),
+            answer("done"),
+        ],
+        builtin_tools(),
+        dir.path(),
+    )
+    .await;
+    config.ctx = config.ctx.with_rules(Arc::new(mason::Rules {
+        write_paths: Some(vec!["notes/*".into()]),
+        hooks: mason::Hooks {
+            after_edit: vec![hook],
+            before_finish: vec![],
+        },
+        ..Default::default()
+    }));
+    let outcome = engine::run(config).await.unwrap();
+    let results = tool_results(&outcome.messages);
+    assert!(results[0].contains("[write on notes/a.md after this edit: FAILED]\npermission denied: this profile may change only: notes/*"), "{}", results[0]);
+    assert!(!dir.path().join("secret/x").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn write_paths_hold_for_where_a_symlink_points() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("allowed")).unwrap();
+    std::fs::create_dir_all(dir.path().join("protected")).unwrap();
+    std::fs::write(dir.path().join("protected/target.txt"), "keep").unwrap();
+    std::os::unix::fs::symlink(
+        dir.path().join("protected/target.txt"),
+        dir.path().join("allowed/link.txt"),
+    )
+    .unwrap();
+    let (mut config, _) = config(
+        vec![
+            call(
+                "write",
+                r#"{"filePath":"allowed/link.txt","content":"changed"}"#,
+            ),
+            answer("done"),
+        ],
+        builtin_tools(),
+        dir.path(),
+    )
+    .await;
+    config.ctx = config.ctx.with_rules(Arc::new(mason::Rules {
+        write_paths: Some(vec!["allowed/*".into()]),
+        ..Default::default()
+    }));
+    let outcome = engine::run(config).await.unwrap();
+    assert!(tool_results(&outcome.messages)[0].contains("may change only: allowed/*"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("protected/target.txt")).unwrap(),
+        "keep"
+    );
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn a_parent_step_after_a_symlink_cannot_leave_write_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("allowed")).unwrap();
+    std::fs::create_dir_all(dir.path().join("protected/sub")).unwrap();
+    std::fs::write(dir.path().join("protected/target.txt"), "keep").unwrap();
+    // allowed/link/.. is protected/, though it reads as allowed/
+    std::os::unix::fs::symlink("../protected/sub", dir.path().join("allowed/link")).unwrap();
+    let (mut config, _) = config(
+        vec![
+            call(
+                "write",
+                r#"{"filePath":"allowed/link/../target.txt","content":"changed"}"#,
+            ),
+            answer("done"),
+        ],
+        builtin_tools(),
+        dir.path(),
+    )
+    .await;
+    config.ctx = config.ctx.with_rules(Arc::new(mason::Rules {
+        write_paths: Some(vec!["allowed/*".into()]),
+        ..Default::default()
+    }));
+    let outcome = engine::run(config).await.unwrap();
+    assert!(tool_results(&outcome.messages)[0].contains("may change only: allowed/*"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("protected/target.txt")).unwrap(),
+        "keep"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hooks_check_the_file_a_symlink_alias_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("crawlers")).unwrap();
+    std::fs::create_dir_all(dir.path().join("notes")).unwrap();
+    std::fs::write(dir.path().join("crawlers/shop.ts"), "").unwrap();
+    std::os::unix::fs::symlink("../crawlers/shop.ts", dir.path().join("notes/link")).unwrap();
+    let mut tools = builtin_tools();
+    tools.push(Box::new(CheckTool));
+    let (mut config, _) = config(
+        vec![
+            call("write", r#"{"filePath":"notes/link","content":"bad"}"#),
+            call("write", r#"{"filePath":"notes/link","content":"ok"}"#),
+            answer("done"),
+        ],
+        tools,
+        dir.path(),
+    )
+    .await;
+    config.ctx = config.ctx.with_rules(Arc::new(rules(None, None)));
+    let outcome = engine::run(config).await.unwrap();
+    let results = tool_results(&outcome.messages);
+    assert!(
+        results[0].contains("[check on crawlers/shop.ts after this edit: FAILED]"),
+        "{}",
+        results[0]
+    );
+    assert!(
+        results[1].contains("[check on crawlers/shop.ts after this edit: passed]"),
+        "{}",
+        results[1]
+    );
+}
+
+#[tokio::test]
+async fn a_hanging_finish_check_ends_at_the_run_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = builtin_tools();
+    tools.push(SleepTool::boxed("check", Duration::from_secs(600), "never"));
+    let (mut config, _) = config(
+        vec![
+            call("write", r#"{"filePath":"crawlers/shop.ts","content":"x"}"#),
+            answer("done"),
+        ],
+        tools,
+        dir.path(),
+    )
+    .await;
+    config.limits.timeout = Duration::from_secs(1);
+    let hook = mason::Hook {
+        pattern: "crawlers/*".into(),
+        tool: "check".into(),
+        args: Default::default(),
+    };
+    config.ctx = config.ctx.with_rules(Arc::new(mason::Rules {
+        hooks: mason::Hooks {
+            after_edit: vec![],
+            before_finish: vec![hook],
+        },
+        ..Default::default()
+    }));
+    let started = std::time::Instant::now();
+    let err = tokio::time::timeout(Duration::from_secs(20), engine::run(config))
+        .await
+        .expect("the deadline ends the hook")
+        .unwrap_err();
+    assert!(matches!(err, Error::RunDeadline(_)), "{err}");
+    // the deadline, then the cleanup grace a call that ignores cancellation gets
+    assert!(
+        started.elapsed() < Duration::from_secs(1) + engine::CLEANUP_GRACE + Duration::from_secs(2)
+    );
+}
+
+#[tokio::test]
+async fn hooks_check_a_file_written_through_a_parent_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = builtin_tools();
+    tools.push(Box::new(CheckTool));
+    let (mut config, _) = config(
+        vec![
+            call(
+                "write",
+                r#"{"filePath":"crawlers/../crawlers/shop.ts","content":"bad"}"#,
+            ),
+            call("write", r#"{"filePath":"crawlers/shop.ts","content":"ok"}"#),
+            answer("done"),
+        ],
+        tools,
+        dir.path(),
+    )
+    .await;
+    config.ctx = config.ctx.with_rules(Arc::new(rules(None, None)));
+    let outcome = engine::run(config).await.unwrap();
+    let results = tool_results(&outcome.messages);
+    assert!(
+        results[0].contains("[check on crawlers/shop.ts after this edit: FAILED]"),
+        "{}",
+        results[0]
+    );
+}
+
+/// A check that, interrupted, cleans up asynchronously before it ends.
+struct CleaningCheck(Arc<std::sync::atomic::AtomicBool>);
+
+#[async_trait::async_trait]
+impl mason::Tool for CleaningCheck {
+    fn spec(&self) -> mason::ToolSpec {
+        mason::ToolSpec::function(
+            "check",
+            "checks slowly",
+            serde_json::json!({"type": "object"}),
+        )
+    }
+    async fn call(
+        &self,
+        _args: serde_json::Value,
+        ctx: &mason::ToolCtx,
+    ) -> std::result::Result<String, mason::ToolError> {
+        ctx.token.cancelled().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        self.0.store(true, Ordering::SeqCst);
+        Err(mason::ToolError::Failure("interrupted".into()))
+    }
+}
+
+#[tokio::test]
+async fn an_interrupted_hook_gets_the_cleanup_grace_of_a_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let cleaned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut tools = builtin_tools();
+    tools.push(Box::new(CleaningCheck(cleaned.clone())));
+    let (mut config, _) = config(
+        vec![
+            call("write", r#"{"filePath":"crawlers/shop.ts","content":"x"}"#),
+            answer("done"),
+        ],
+        tools,
+        dir.path(),
+    )
+    .await;
+    config.limits.timeout = Duration::from_secs(1);
+    let hook = mason::Hook {
+        pattern: "crawlers/*".into(),
+        tool: "check".into(),
+        args: Default::default(),
+    };
+    config.ctx = config.ctx.with_rules(Arc::new(mason::Rules {
+        hooks: mason::Hooks {
+            after_edit: vec![],
+            before_finish: vec![hook],
+        },
+        ..Default::default()
+    }));
+    let err = engine::run(config).await.unwrap_err();
+    assert!(matches!(err, Error::RunDeadline(_)), "{err}");
+    assert!(
+        cleaned.load(Ordering::SeqCst),
+        "the hook finished its cleanup"
+    );
+}
+
+#[tokio::test]
+async fn hooks_run_outside_the_tool_call_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = builtin_tools();
+    tools.push(Box::new(CheckTool));
+    let (mut config, _) = config(
+        vec![
+            call("write", r#"{"filePath":"crawlers/shop.ts","content":"ok"}"#),
+            answer("done"),
+        ],
+        tools,
+        dir.path(),
+    )
+    .await;
+    config.limits.max_total_tool_calls = 1;
+    config.ctx = config.ctx.with_rules(Arc::new(rules(None, None)));
+    // the write took the one call; its after-edit and finish checks still run
+    let outcome = engine::run(config).await.unwrap();
+    assert_eq!(outcome.answer, "done");
+    let edit_result = outcome.messages[2].content.as_deref().unwrap();
+    assert!(
+        edit_result.contains("after this edit: passed"),
+        "{edit_result}"
+    );
+}
+
+/// Approves `check` slowly, like a person at an approval prompt.
+struct SlowApproval;
+
+#[async_trait::async_trait]
+impl mason::tool::policy::ToolPolicy for SlowApproval {
+    async fn authorize(
+        &self,
+        name: &str,
+        _args: &serde_json::Value,
+        _ctx: &mason::ToolCtx,
+    ) -> std::result::Result<(), mason::ToolError> {
+        if name == "check" {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn approval_granted_after_cancellation_starts_no_hook() {
+    let dir = tempfile::tempdir().unwrap();
+    let (checker, calls) = EchoTool::boxed("check", "ok");
+    let mut tools = builtin_tools();
+    tools.push(checker);
+    let (mut config, _) = config(
+        vec![
+            call("write", r#"{"filePath":"crawlers/shop.ts","content":"x"}"#),
+            answer("done"),
+        ],
+        tools,
+        dir.path(),
+    )
+    .await;
+    config.limits.timeout = Duration::from_secs(1);
+    let hook = mason::Hook {
+        pattern: "crawlers/*".into(),
+        tool: "check".into(),
+        args: Default::default(),
+    };
+    config.ctx = config
+        .ctx
+        .with_execution(
+            mason::tool::policy::ExecutionMode::Trusted,
+            false,
+            Arc::new(SlowApproval),
+        )
+        .with_rules(Arc::new(mason::Rules {
+            hooks: mason::Hooks {
+                after_edit: vec![],
+                before_finish: vec![hook],
+            },
+            ..Default::default()
+        }));
+    let err = engine::run(config).await.unwrap_err();
+    assert!(matches!(err, Error::RunDeadline(_)), "{err}");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the approval came during the grace: no call"
+    );
+}
+
+#[tokio::test]
+async fn a_finish_check_takes_the_one_tool_slot_without_deadlock() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = builtin_tools();
+    tools.push(Box::new(CheckTool));
+    let (mut config, _) = config(
+        vec![
+            call("write", r#"{"filePath":"crawlers/shop.ts","content":"ok"}"#),
+            answer("done"),
+        ],
+        tools,
+        dir.path(),
+    )
+    .await;
+    config.limits.max_concurrent_tools = 1;
+    config.ctx = config.ctx.with_rules(Arc::new(rules(None, None)));
+    let outcome = tokio::time::timeout(Duration::from_secs(10), engine::run(config)).await;
+    assert_eq!(outcome.expect("no deadlock").unwrap().answer, "done");
+}

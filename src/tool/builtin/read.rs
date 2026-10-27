@@ -40,6 +40,10 @@ fn default_limit() -> usize {
 impl TypedTool for ReadTool {
     type Args = ReadArgs;
 
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "read"
     }

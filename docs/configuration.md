@@ -49,6 +49,8 @@ Shared by `run`, `serve` and `mcp`:
 | --- | --- | --- | --- |
 | `--listen` | `MASON_LISTEN` | `127.0.0.1:3120` | Address to listen on. |
 | `--api-token` | `MASON_API_TOKEN` | required | Bearer token for all API clients (at least 16 characters). |
+| `--run-webhook` | `MASON_RUN_WEBHOOK` | — | Url each finished, failed or interrupted run is POSTed to ([api.md](api.md)). |
+| `--run-webhook-secret` | `MASON_RUN_WEBHOOK_SECRET` | — | Bearer token sent with run webhook POSTs. |
 | `--max-active-runs` | `MASON_MAX_ACTIVE_RUNS` | 4 | Concurrently active root sessions. |
 | `--max-pending-sessions` | `MASON_MAX_PENDING_SESSIONS` | 128 | Admitted running/queued root sessions. |
 | `--db` | `MASON_DB` | `<cwd>/.mason/mason.db` | SQLite session database. |
@@ -72,11 +74,38 @@ A manifest carries:
 - `profiles` — a builtin name *patches* the resolved builtin, keeping
   everything it does not mention; any other name registers a new profile
   (a description is required). Fields: `description`, `prompt`, `tools`,
-  `allowed_subagents`, `subagent`, `max_steps`.
+  `deny`, `read_only`, `shell`, `write_paths`, `hooks`, `allowed_subagents`,
+  `subagent`, `max_steps`:
+  - `tools` entries are names or `*` globs (`acme_*`); `deny` takes names or
+    globs away. With `read_only: true` a glob admits only tools that declare
+    themselves read-only (MCP's `readOnlyHint`; the builtin `read`, `grep` and
+    `glob`), while a tool listed by exact name is taken as given.
+  - `shell` lists the command globs `bash` may run (`git -C repo status*`); an
+    allowed command may not chain or redirect (`; & | $ \` ( ) < >`, newline).
+    `write_paths` lists the path globs, relative to the working directory,
+    `write` and `edit` may change, checked against where the write lands
+    (symlinks followed; a path with `..` is refused). Both are unrestricted when omitted. MCP tools are
+    outside them: restrict those with `tools`/`deny`. See the README's
+    "Operating profile rules".
+  - `hooks` run a tool around edits: `after_edit` after each successful `write`
+    or `edit` of a matching file, its result appended to the edit's output;
+    `before_finish` on every matching file the run edited, before the run may
+    end - a failed check (an error result) is sent back to the agent, up to
+    three times, after which (or on the run's final turn) the run fails. Hooks
+    are authorized and cancelled like ordinary calls, outside the tool-call budget; `bash` cannot be a hook, as its exit
+    code is not an error result. `{path}` in `args` is the file's
+    workspace-relative path:
+
+    ```yaml
+    hooks:
+      after_edit: [{match: "crawlers/*.ts", tool: acme_check, args: {file: "{path}"}}]
+      before_finish: [{match: "crawlers/*.ts", tool: acme_check, args: {file: "{path}"}}]
+    ```
 - `select_profile` — rules choosing a profile from a session's opaque
   `metadata`. Conditions are ANDed, the first matching rule wins, and
   `present` means the path exists and is not null.
-- `mcp` servers (or an `mcp_file`), plus the execution grants
+- `mcp` servers (or an `mcp_file`), whose tools every top-level run lists
+  again, so a server's new or changed tools need no restart, plus the execution grants
   `execution_mode` (default `trusted`), `allow_network` and `allow_mcp`
   (both fail closed).
 - Optionally `prompts`, `skills_dir`, `memory_dir`, `limits`, `spill` and `cwd`. Relative

@@ -374,6 +374,9 @@ impl Tool for IsolatedFileTool {
     fn spec(&self) -> crate::llm::ToolSpec {
         self.0.spec()
     }
+    fn read_only(&self) -> bool {
+        self.0.read_only()
+    }
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<String, ToolError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let executable = std::env::current_exe()

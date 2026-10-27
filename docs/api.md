@@ -22,7 +22,7 @@ Embedders get the same layer with `router_with_security`; bare
 | `PATCH /sessions/:id` | Sets `title` and/or `metadata` (`null` clears it). |
 | `DELETE /sessions/:id` | Removes an idle session with its history and children; 409 while it runs. |
 | `POST /sessions/:id/messages` | Submit an input; see below. |
-| `GET /sessions/:id/inputs` | The inbox with keys and consumption times; paged with `after`/`limit`. |
+| `GET /sessions/:id/inputs` | The inbox with keys, consumption times, and the run each input entered (`runId`) with its `outcome`: `running`, `finished`, `failed` or `interrupted`; paged with `after`/`limit`. |
 | `DELETE /sessions/:id/inputs/:input` | Withdraw an input that has not entered the conversation. |
 | `POST /sessions/:id/interrupt` | Interrupt the session's current run (204). |
 | `POST /sessions/:id/resume` | Drain a stalled session's queued inputs again. |
@@ -84,3 +84,19 @@ default 500, max 1000) or, with `Accept: text/event-stream`, an SSE stream:
   immediately. HTTP draining and run cleanup proceed concurrently, each with
   a five-second grace period; a slow SSE reader cannot delay tool
   cancellation.
+
+## Run webhook
+
+`serve --run-webhook <url>` (`MASON_RUN_WEBHOOK`) POSTs every finished, failed
+or interrupted top-level run to the url, including runs a restart found
+abandoned. `--run-webhook-secret` (`MASON_RUN_WEBHOOK_SECRET`) is sent as a
+bearer token; the API token never leaves the server.
+
+```json
+{"type": "run.finished", "sessionId": 7, "runId": "…",
+ "inputs": [{"id": 31, "key": "issue-12"}], "metadata": {"site_id": 3},
+ "data": {"answer": "…"}}
+```
+
+Delivery is best effort, without retries; the inbox's `runId` and `outcome`
+remain the record.

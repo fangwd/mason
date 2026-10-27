@@ -24,9 +24,16 @@ pub struct Profile {
     pub description: String,
     /// Extra system-prompt prose for this profile.
     pub prompt: Option<String>,
-    /// `None` allows every base tool. Runtime-owned `task` and `skill` names may be
-    /// listed explicitly.
+    /// `None` allows every base tool. Entries are names or `*` globs
+    /// (`acme_*`); runtime-owned `task` and `skill` names may be listed explicitly.
     pub tools: Option<Vec<String>>,
+    /// Names or globs taken away from what `tools` allows.
+    pub deny: Vec<String>,
+    /// Tools a glob admits must declare themselves read-only (MCP's
+    /// `readOnlyHint`); tools listed by exact name are taken as given.
+    pub read_only: bool,
+    /// What `bash`, `write` and `edit` may do, and checks run around edits.
+    pub rules: Rules,
     /// Explicit child allowlist; subagent profiles must leave it empty.
     pub allowed_subagents: Vec<String>,
     /// Subagent-only profile, launchable through `task` but not as a top-level session.
@@ -43,6 +50,9 @@ impl Profile {
             description: description.into(),
             prompt: None,
             tools: None,
+            deny: Vec::new(),
+            read_only: false,
+            rules: Rules::default(),
             allowed_subagents: Vec::new(),
             subagent: false,
             max_steps: 50,
@@ -57,12 +67,206 @@ impl Profile {
         }
     }
 
-    /// Whether this profile's tool policy allows `name`.
-    pub fn allows(&self, name: &str) -> bool {
-        self.tools
-            .as_ref()
-            .is_none_or(|tools| tools.iter().any(|tool| tool == name))
+    /// Whether this profile's tool policy allows the tool `name`; `read_only` is
+    /// whether the tool declares itself read-only (runtime-owned tools pass false).
+    pub fn admits(&self, name: &str, read_only: bool) -> bool {
+        if self.deny.iter().any(|pattern| glob_match(pattern, name)) {
+            return false;
+        }
+        match &self.tools {
+            None => !self.read_only || read_only,
+            Some(tools) => tools.iter().any(|entry| {
+                if entry == name {
+                    true
+                } else {
+                    entry.contains('*') && glob_match(entry, name) && (!self.read_only || read_only)
+                }
+            }),
+        }
     }
+
+    /// Whether this profile allows the runtime-owned tool `name`: `skill` only
+    /// reads; `task` and `memory` may not.
+    pub fn allows(&self, name: &str) -> bool {
+        self.admits(name, name == "skill")
+    }
+}
+
+/// Matches `text` against `pattern`, where `*` stands for any run of characters
+/// (`/` included) and everything else is literal.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == text;
+    }
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if !text.starts_with(first) || text.len() < first.len() + last.len() || !text.ends_with(last) {
+        return false;
+    }
+    let mut rest = &text[first.len()..text.len() - last.len()];
+    for part in &parts[1..parts.len() - 1] {
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+/// A check a profile runs on edited files: `tool` called with `args`, where
+/// `{path}` in a string value is the edited file's path relative to the
+/// working directory. A call that fails (an error result) is a failed check.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hook {
+    /// Workspace-relative path glob of the files the check is for.
+    #[serde(rename = "match")]
+    pub pattern: String,
+    pub tool: String,
+    #[serde(default)]
+    pub args: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Hook {
+    /// The call's arguments for one edited file.
+    pub fn args_for(&self, path: &str) -> serde_json::Value {
+        fn fill(value: &serde_json::Value, path: &str) -> serde_json::Value {
+            match value {
+                serde_json::Value::String(text) => {
+                    serde_json::Value::String(text.replace("{path}", path))
+                }
+                serde_json::Value::Array(items) => {
+                    items.iter().map(|item| fill(item, path)).collect()
+                }
+                serde_json::Value::Object(map) => map
+                    .iter()
+                    .map(|(key, item)| (key.clone(), fill(item, path)))
+                    .collect(),
+                other => other.clone(),
+            }
+        }
+        fill(&serde_json::Value::Object(self.args.clone()), path)
+    }
+}
+
+/// Checks run around a profile's edits.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hooks {
+    /// After each successful `write` or `edit` of a matching file; the result is
+    /// appended to the edit's output.
+    #[serde(default)]
+    pub after_edit: Vec<Hook>,
+    /// Before the run may finish, for every matching file it edited; a failure is
+    /// sent back to the agent instead of ending the run.
+    #[serde(default)]
+    pub before_finish: Vec<Hook>,
+}
+
+/// What a profile's `bash`, `write` and `edit` calls may do, and its hooks.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Rules {
+    /// Command globs `bash` may run (`git -C crawlers status*`); `None` allows any.
+    /// An allowed command may not chain or redirect (`; & | $ \` ( ) < >` or a
+    /// newline), so a pattern cannot be extended into another command.
+    pub shell: Option<Vec<String>>,
+    /// Path globs, relative to the working directory, `write` and `edit` may
+    /// change; `None` allows any.
+    pub write_paths: Option<Vec<String>>,
+    pub hooks: Hooks,
+}
+
+impl Rules {
+    /// Why `name` may not run with `args`, if it may not.
+    pub fn check(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+        cwd: &std::path::Path,
+    ) -> Option<String> {
+        match name {
+            "bash" => {
+                let allowed = self.shell.as_ref()?;
+                let command = args
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .trim();
+                if command.contains([';', '&', '|', '$', '`', '(', ')', '<', '>', '\n', '\r']) {
+                    return Some(format!(
+                        "this profile runs single commands without chaining or redirection; allowed: {}",
+                        allowed.join(", ")
+                    ));
+                }
+                (!allowed.iter().any(|pattern| glob_match(pattern, command)))
+                    .then(|| format!("this profile's shell allows only: {}", allowed.join(", ")))
+            }
+            "write" | "edit" => {
+                let allowed = self.write_paths.as_ref()?;
+                let path = args
+                    .get("filePath")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                match write_target(cwd, path) {
+                    Some(relative)
+                        if allowed.iter().any(|pattern| glob_match(pattern, &relative)) =>
+                    {
+                        None
+                    }
+                    _ => Some(format!(
+                        "this profile may change only: {}",
+                        allowed.join(", ")
+                    )),
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Where a write of `path` lands, relative to `cwd`, symlinks followed as the
+/// write follows them; `None` outside `cwd`, or for a path with `..`, which
+/// after a symlink resolves from the link's target, not from where it is.
+pub fn write_target(cwd: &std::path::Path, path: &str) -> Option<String> {
+    if std::path::Path::new(path)
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return None;
+    }
+    let target = crate::tool::policy::workspace_path(cwd, path).ok()?;
+    relative_path(&cwd.canonicalize().ok()?, target.to_str()?)
+}
+
+/// The file a write of `path` changed, relative to `cwd`, as the filesystem
+/// resolved it (symlinks and `..` alike); `None` outside `cwd`.
+pub fn written_file(cwd: &std::path::Path, path: &str) -> Option<String> {
+    let written = cwd.join(path).canonicalize().ok()?;
+    relative_path(&cwd.canonicalize().ok()?, written.to_str()?)
+}
+
+/// `path` relative to `cwd`, `/`-separated, with `.` and `..` resolved
+/// lexically; `None` when it leaves `cwd`.
+pub fn relative_path(cwd: &std::path::Path, path: &str) -> Option<String> {
+    use std::path::Component;
+    let joined = cwd.join(path);
+    let mut parts: Vec<String> = Vec::new();
+    let mut base = std::path::PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => base.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop()?;
+            }
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+        }
+    }
+    let full = parts.iter().fold(base, |path, part| path.join(part));
+    full.strip_prefix(cwd)
+        .ok()
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .filter(|relative| !relative.is_empty())
 }
 
 /// Rejects an explicit null so it cannot be confused with an omitted field.
@@ -94,6 +298,16 @@ pub struct ProfilePatch {
     pub prompt: Option<String>,
     #[serde(default, deserialize_with = "deny_null")]
     pub tools: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deny_null")]
+    pub deny: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deny_null")]
+    pub read_only: Option<bool>,
+    #[serde(default, deserialize_with = "deny_null")]
+    pub shell: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deny_null")]
+    pub write_paths: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deny_null")]
+    pub hooks: Option<Hooks>,
     #[serde(default, deserialize_with = "deny_null")]
     pub allowed_subagents: Option<Vec<String>>,
     #[serde(default, deserialize_with = "deny_null")]
@@ -140,6 +354,21 @@ impl ProfilePatch {
         }
         if let Some(tools) = &self.tools {
             profile.tools = Some(tools.clone());
+        }
+        if let Some(deny) = &self.deny {
+            profile.deny = deny.clone();
+        }
+        if let Some(read_only) = self.read_only {
+            profile.read_only = read_only;
+        }
+        if let Some(shell) = &self.shell {
+            profile.rules.shell = Some(shell.clone());
+        }
+        if let Some(paths) = &self.write_paths {
+            profile.rules.write_paths = Some(paths.clone());
+        }
+        if let Some(hooks) = &self.hooks {
+            profile.rules.hooks = hooks.clone();
         }
         if let Some(children) = &self.allowed_subagents {
             profile.allowed_subagents = children.clone();
@@ -273,12 +502,37 @@ impl ProfileSet {
                     if name == "skill" || name == "task" {
                         continue; // runtime-owned, assembled per run
                     }
-                    if tools.get(name).is_none() {
+                    let found = if name.contains('*') {
+                        tools.names().iter().any(|tool| glob_match(name, tool))
+                    } else {
+                        tools.get(name).is_some()
+                    };
+                    if !found {
                         return Err(Error::Config(format!(
                             "profile `{}` references the unregistered tool `{name}`",
                             profile.name
                         )));
                     }
+                }
+            }
+            let hooks = &profile.rules.hooks;
+            for hook in hooks.after_edit.iter().chain(&hooks.before_finish) {
+                // a hook fails by the tool's error result, which bash never gives
+                if hook.tool == "bash" {
+                    return Err(Error::Config(format!(
+                        "profile `{}` hooks `bash`, which reports a failing command's exit code in \
+                         its output rather than as an error: hook a tool that fails with an error",
+                        profile.name
+                    )));
+                }
+                let admitted = tools
+                    .get(&hook.tool)
+                    .is_some_and(|tool| profile.admits(&hook.tool, tool.read_only()));
+                if !admitted {
+                    return Err(Error::Config(format!(
+                        "profile `{}` hooks the tool `{}`, which it does not have",
+                        profile.name, hook.tool
+                    )));
                 }
             }
             if profile.subagent && !profile.allowed_subagents.is_empty() {
@@ -911,6 +1165,137 @@ mod tests {
         assert!(
             description.starts_with("Reloaded general description"),
             "{description}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::*;
+
+    #[test]
+    fn globs_match_any_run_of_characters() {
+        assert!(glob_match("jscrawl_*", "jscrawl_sql"));
+        assert!(glob_match("crawlers/*.ts", "crawlers/shop.ts"));
+        assert!(glob_match(
+            "git -C crawlers status*",
+            "git -C crawlers status --short"
+        ));
+        assert!(glob_match("*", ""));
+        assert!(!glob_match("crawlers/*.ts", "crawlers/shop.js"));
+        assert!(!glob_match("a*b*c", "abxb"));
+        assert!(glob_match("exact", "exact") && !glob_match("exact", "exactly"));
+    }
+
+    #[test]
+    fn read_only_profiles_admit_globbed_tools_only_when_they_only_read() {
+        let profile = Profile {
+            tools: Some(vec!["read".into(), "acme_*".into(), "acme_resolve".into()]),
+            deny: vec!["acme_secret*".into()],
+            read_only: true,
+            ..Profile::new("triage", "")
+        };
+        assert!(profile.admits("acme_sql", true));
+        assert!(
+            !profile.admits("acme_write", false),
+            "a glob admits no writing tool"
+        );
+        assert!(
+            profile.admits("acme_resolve", false),
+            "an exact name is taken as given"
+        );
+        assert!(profile.admits("read", false));
+        assert!(!profile.admits("acme_secret_sql", true), "denied");
+        assert!(!profile.admits("bash", false));
+        let open = Profile {
+            deny: vec!["bash".into()],
+            ..Profile::new("build", "")
+        };
+        assert!(open.admits("write", false) && !open.admits("bash", false));
+    }
+
+    #[test]
+    fn read_only_profiles_keep_the_skill_tool_and_shells_refuse_carriage_returns() {
+        let profile = Profile {
+            read_only: true,
+            ..Profile::new("p", "")
+        };
+        assert!(profile.allows("skill"));
+        assert!(!profile.allows("memory") && !profile.allows("task"));
+        let rules = Rules {
+            shell: Some(vec!["git status*".into()]),
+            ..Rules::default()
+        };
+        let cwd = std::path::Path::new("/w");
+        assert!(
+            rules
+                .check("bash", &serde_json::json!({"command": "git status"}), cwd)
+                .is_none()
+        );
+        assert!(
+            rules
+                .check(
+                    "bash",
+                    &serde_json::json!({"command": "git status\rrm -rf x"}),
+                    cwd
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_bash_hook_is_refused_for_its_exit_codes() {
+        let mut tools = Toolset::new();
+        tools.extend(crate::tool::builtin_tools()).unwrap();
+        let mut set = ProfileSet::default();
+        let hook = Hook {
+            pattern: "*".into(),
+            tool: "bash".into(),
+            args: Default::default(),
+        };
+        let mut profile = Profile::new("p", "");
+        profile.rules.hooks.after_edit.push(hook);
+        set.register(profile).unwrap();
+        let err = set.validate(&tools).unwrap_err().to_string();
+        assert!(err.contains("hooks `bash`"), "{err}");
+    }
+
+    #[test]
+    fn relative_paths_resolve_dots_and_refuse_leaving_the_workspace() {
+        let cwd = std::path::Path::new("/w");
+        assert_eq!(
+            relative_path(cwd, "crawlers/./a.ts").as_deref(),
+            Some("crawlers/a.ts")
+        );
+        assert_eq!(
+            relative_path(cwd, "/w/crawlers/a.ts").as_deref(),
+            Some("crawlers/a.ts")
+        );
+        assert_eq!(
+            relative_path(cwd, "crawlers/../src/a.ts").as_deref(),
+            Some("src/a.ts")
+        );
+        assert_eq!(relative_path(cwd, "../etc/passwd"), None);
+        assert_eq!(relative_path(cwd, "/etc/passwd"), None);
+    }
+
+    #[test]
+    fn patches_set_tool_patterns_rules_and_hooks() {
+        let patch: ProfilePatch = serde_saphyr::from_str(
+            "tools: [read, 'acme_*']\ndeny: [acme_drop]\nread_only: true\nshell: ['git status*']\n\
+             write_paths: ['crawlers/*']\nhooks:\n  after_edit:\n    - {match: 'crawlers/*.ts', tool: acme_check, args: {file: '{path}'}}\n",
+        )
+        .unwrap();
+        let profile = patch.into_profile("p").unwrap();
+        assert_eq!(profile.deny, ["acme_drop"]);
+        assert!(profile.read_only);
+        assert_eq!(
+            profile.rules.shell.as_deref(),
+            Some(&["git status*".to_owned()][..])
+        );
+        assert_eq!(
+            profile.rules.hooks.after_edit[0].args_for("crawlers/a.ts"),
+            serde_json::json!({"file": "crawlers/a.ts"})
         );
     }
 }

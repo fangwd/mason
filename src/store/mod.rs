@@ -125,6 +125,10 @@ pub struct StoredInput {
     pub created_at: DateTime<Utc>,
     /// When it entered a conversation; `None` while it is still pending.
     pub consumed_at: Option<DateTime<Utc>>,
+    /// The run it entered; `None` while it is still pending.
+    pub run_id: Option<String>,
+    /// That run's outcome: `running`, `finished`, `failed` or `interrupted`.
+    pub outcome: Option<String>,
 }
 
 /// Committed event whose ID is the replay cursor.
@@ -201,6 +205,9 @@ pub struct Recovery {
     /// `(session_id, run_id)` pairs repaired by this call.
     pub interrupted: Vec<(SessionId, String)>,
 }
+
+/// The error recorded on a run the process restarted out of.
+pub const RESTART_INTERRUPTED: &str = "the process restarted while this run was active";
 
 /// Session persistence backend. Coordination is single-process; multi-process use
 /// requires external leasing.

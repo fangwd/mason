@@ -62,6 +62,8 @@ pub struct ToolCtx {
     pub execution_mode: policy::ExecutionMode,
     pub allow_network: bool,
     pub policy: Arc<dyn policy::ToolPolicy>,
+    /// The running profile's limits on `bash`, `write` and `edit`, and its hooks.
+    pub rules: Option<Arc<crate::profile::Rules>>,
     /// Per-session resource scope; different sessions and children never share MCP state.
     pub resources: Arc<std::sync::Mutex<HashMap<String, Arc<dyn std::any::Any + Send + Sync>>>>,
 }
@@ -108,6 +110,7 @@ impl ToolCtx {
             execution_mode: policy::ExecutionMode::Trusted,
             allow_network: false,
             policy: Arc::new(policy::AllowTools),
+            rules: None,
             resources: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -123,6 +126,12 @@ impl ToolCtx {
     pub fn with_scope(mut self, scope: &ToolScope) -> Self {
         self.processes = scope.processes.clone();
         self.resources = scope.resources.clone();
+        self
+    }
+
+    /// Sets the running profile's rules.
+    pub fn with_rules(mut self, rules: Arc<crate::profile::Rules>) -> Self {
+        self.rules = Some(rules);
         self
     }
 
@@ -175,6 +184,16 @@ pub trait Tool: Send + Sync {
     /// Runs one call with raw JSON arguments. Implementations validate;
     /// [`Typed`] does it through serde.
     async fn call(&self, args: Value, ctx: &ToolCtx) -> std::result::Result<String, ToolError>;
+
+    /// Whether the tool only reads: a `read_only` profile's globs admit no other.
+    fn read_only(&self) -> bool {
+        false
+    }
+
+    /// The MCP server the tool comes from, if any.
+    fn mcp_server(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// A tool with typed, schema-derived arguments. Wrap in [`Typed`] to get the
@@ -192,6 +211,11 @@ pub trait TypedTool: Send + Sync {
 
     /// Runs one call with validated arguments.
     async fn run(&self, args: Self::Args, ctx: &ToolCtx) -> std::result::Result<String, ToolError>;
+
+    /// Whether the tool only reads.
+    fn read_only(&self) -> bool {
+        false
+    }
 }
 
 /// Derives argument schemas and validation, exposing invalid arguments as model-visible
@@ -211,6 +235,10 @@ impl<T: TypedTool> Tool for Typed<T> {
         let args = serde_json::from_value::<T::Args>(args)
             .map_err(|err| ToolError::Failure(format!("invalid arguments: {err}")))?;
         self.0.run(args, ctx).await
+    }
+
+    fn read_only(&self) -> bool {
+        self.0.read_only()
     }
 }
 

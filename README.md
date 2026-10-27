@@ -54,6 +54,28 @@ needs no Rust — a YAML manifest is enough
 | [security.md](docs/security.md) | Execution modes, sandbox, access and persistence |
 | [architecture.md](docs/architecture.md) | Runtime limits, context management, source layout |
 
+## Operating profile rules
+
+Profile `shell`, `write_paths` and `hooks` ([configuration.md](docs/configuration.md))
+hold only when they are operated this way:
+
+- **Write `shell` patterns as narrowly as the commands.** A trailing `*` admits
+  any flags: `git diff*` admits `git diff --output=FILE`, which writes a file.
+- **Give a profile with `write_paths` a `shell` list too, and never allow `ln`.**
+  `write_paths` is checked against where a write lands, symlinks followed, but a
+  symlink created or swapped after the check is outside it; an unrestricted shell
+  can write anywhere anyway.
+- **Hook tools must report failure as an error.** `bash` reports a failing
+  command's exit code in its output, so it is refused as a hook; wrap a shell
+  check in an MCP tool that fails with an error.
+- **Hooks are called like ordinary tool calls** (host policy and profile rules
+  apply) and only on `write` and `edit`; a file changed another way is not checked.
+- **Restart `mason serve` after changing `agent.yaml`.** Profiles, rules and hooks
+  are read at startup. MCP *tools* need no restart: every run lists them again,
+  and a session's server process whose tools differ from a run's listing is
+  restarted as that run starts (never mid-run), losing the process's in-memory
+  state.
+
 ## Development
 
 ```sh

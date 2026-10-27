@@ -170,6 +170,7 @@ impl McpServers {
                         }
                         tools.push(Arc::new(ScopedMcpTool {
                             spec,
+                            read_only: tool.read_only(),
                             server: name.clone(),
                             config: config.clone(),
                             mode,
@@ -406,9 +407,50 @@ pub(crate) async fn close_scope(
     }
 }
 
+/// Closes the scope's server connections whose tools differ from `listed`, the
+/// run's fresh listing: a session's server process that predates a new or
+/// changed tool. Called as a run starts, before it dispatches any call; the
+/// next call starts the server again.
+pub async fn close_outdated(scope: &crate::tool::ToolScope, listed: &[Arc<dyn Tool>]) {
+    let connections: Vec<_> = scope
+        .resources
+        .lock()
+        .expect("tool resource mutex")
+        .iter()
+        .filter_map(|(key, value)| {
+            let server = key.strip_prefix("mcp:")?;
+            let connection = value
+                .clone()
+                .downcast::<tokio::sync::Mutex<Option<McpConnection>>>()
+                .ok()?;
+            Some((server.to_owned(), connection))
+        })
+        .collect();
+    for (server, connection) in connections {
+        let mut connection = connection.lock().await;
+        let Some(open) = connection.as_ref() else {
+            continue;
+        };
+        let mut had: Vec<_> = open.tools().iter().map(|tool| tool.spec()).collect();
+        let mut has: Vec<_> = listed
+            .iter()
+            .filter(|tool| tool.mcp_server() == Some(server.as_str()))
+            .map(|tool| tool.spec())
+            .collect();
+        had.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+        has.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+        if had != has
+            && let Some(outdated) = connection.take()
+        {
+            let _ = tokio::time::timeout(crate::engine::CLEANUP_GRACE, outdated.close()).await;
+        }
+    }
+}
+
 /// A new connection for each run/child, shared only by tools in that scope.
 struct ScopedMcpTool {
     spec: ToolSpec,
+    read_only: bool,
     server: String,
     config: McpServerConfig,
     mode: crate::tool::policy::ExecutionMode,
@@ -419,6 +461,12 @@ struct ScopedMcpTool {
 impl Tool for ScopedMcpTool {
     fn spec(&self) -> ToolSpec {
         self.spec.clone()
+    }
+    fn read_only(&self) -> bool {
+        self.read_only
+    }
+    fn mcp_server(&self) -> Option<&str> {
+        Some(&self.server)
     }
     async fn call(&self, args: Value, ctx: &ToolCtx) -> std::result::Result<String, ToolError> {
         type Connection = tokio::sync::Mutex<Option<McpConnection>>;
@@ -434,33 +482,43 @@ impl Tool for ScopedMcpTool {
         // The lock only covers connecting; calls to one server run concurrently.
         let tool = {
             let mut connection = connection.lock().await;
-            // A server that went away since the last call is started again.
+            let mut config = self.config.clone();
+            if let McpServerConfig::Local { cwd, .. } = &mut config
+                && cwd.is_none()
+            {
+                *cwd = Some(ctx.cwd.to_string_lossy().into_owned());
+            }
+            let find = |connection: &Option<McpConnection>| {
+                connection.as_ref().and_then(|connection| {
+                    connection
+                        .tools()
+                        .iter()
+                        .find(|tool| tool.spec().function.name == self.spec.function.name)
+                        .cloned()
+                })
+            };
+            // A server that went away since the last call is started again. One that
+            // predates the run's listing was closed when the run started
+            // (`close_outdated`), so an open connection is as new as the listing or
+            // newer, and calls in flight on it are never cut off.
             if connection.as_ref().is_some_and(McpConnection::is_closed)
                 && let Some(closed) = connection.take()
             {
                 let _ = tokio::time::timeout(crate::engine::CLEANUP_GRACE, closed.close()).await;
             }
             if connection.is_none() {
-                let mut config = self.config.clone();
-                if let McpServerConfig::Local { cwd, .. } = &mut config
-                    && cwd.is_none()
-                {
-                    *cwd = Some(ctx.cwd.to_string_lossy().into_owned());
-                }
                 *connection = Some(
                     connect_config(&self.server, &config, self.mode, self.network)
                         .await
                         .map_err(ToolError::failure)?,
                 );
             }
-            connection
-                .as_ref()
-                .expect("connected")
-                .tools()
-                .iter()
-                .find(|tool| tool.spec().function.name == self.spec.function.name)
-                .cloned()
-                .ok_or_else(|| ToolError::failure("MCP tool disappeared after reconnect"))?
+            find(&connection).ok_or_else(|| {
+                ToolError::failure(
+                    "this session's MCP server does not offer this tool; a server older than \
+                         the run's tools starts again with the next run",
+                )
+            })?
         };
         tool.call(args, ctx).await
     }
@@ -471,6 +529,8 @@ struct McpTool {
     spec: ToolSpec,
     peer: Peer<RoleClient>,
     remote_name: String,
+    /// The server's `readOnlyHint`.
+    read_only: bool,
 }
 
 impl McpTool {
@@ -486,6 +546,11 @@ impl McpTool {
             spec: ToolSpec::function(name, description, parameters),
             peer,
             remote_name: tool.name.to_string(),
+            read_only: tool
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.read_only_hint)
+                .unwrap_or(false),
         }
     }
 }
@@ -494,6 +559,10 @@ impl McpTool {
 impl Tool for McpTool {
     fn spec(&self) -> ToolSpec {
         self.spec.clone()
+    }
+
+    fn read_only(&self) -> bool {
+        self.read_only
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> std::result::Result<String, ToolError> {

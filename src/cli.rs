@@ -151,6 +151,12 @@ enum Command {
         /// Bearer token required by all API clients (at least 16 characters).
         #[arg(long, env = "MASON_API_TOKEN", hide_env_values = true)]
         api_token: Option<String>,
+        /// A url each finished, failed or interrupted run is POSTed to.
+        #[arg(long, env = "MASON_RUN_WEBHOOK")]
+        run_webhook: Option<String>,
+        /// Bearer token sent with each run webhook POST.
+        #[arg(long, env = "MASON_RUN_WEBHOOK_SECRET", hide_env_values = true)]
+        run_webhook_secret: Option<String>,
         /// Maximum concurrently active root sessions.
         #[arg(long, env = "MASON_MAX_ACTIVE_RUNS", default_value_t = 4)]
         max_active_runs: usize,
@@ -203,6 +209,8 @@ pub async fn main() -> Result<()> {
             db,
             common,
             api_token,
+            run_webhook,
+            run_webhook_secret,
             max_active_runs,
             max_pending_sessions,
         } => {
@@ -218,8 +226,12 @@ pub async fn main() -> Result<()> {
             let listener = tokio::net::TcpListener::bind(listen)
                 .await
                 .map_err(|err| Error::Config(format!("cannot listen on {listen}: {err}")))?;
+            let webhook = run_webhook.map(|url| crate::runner::RunWebhook {
+                url,
+                secret: run_webhook_secret,
+            });
             let security = crate::api::ApiSecurity::new(token)?;
-            serve(listener, security, db, common, limits).await
+            serve(listener, security, db, common, limits, webhook).await
         }
     }
 }
@@ -510,11 +522,15 @@ async fn serve(
     db: Option<PathBuf>,
     common: CommonArgs,
     limits: crate::runner::RunnerLimits,
+    webhook: Option<crate::runner::RunWebhook>,
 ) -> Result<()> {
     let agent = build_agent(&common).await?;
     let db = db.unwrap_or_else(|| agent.cwd().join(".mason/mason.db"));
     let store = Arc::new(SqliteStore::open(&db).await?);
     let runner = Runner::with_limits(agent, store, limits)?;
+    if let Some(webhook) = webhook {
+        runner.notify_runs(webhook);
+    }
     let recovery = runner.recover_and_drain().await?;
     if !recovery.interrupted.is_empty() {
         tracing::warn!(

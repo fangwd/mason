@@ -27,6 +27,10 @@ pub struct GlobArgs {
 impl TypedTool for GlobTool {
     type Args = GlobArgs;
 
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         "glob"
     }

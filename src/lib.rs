@@ -36,7 +36,7 @@ pub use llm::{
     Role, ToolCall, ToolSpec, TurnAccumulator, Usage, Vendor, VendorModel, Vendors,
     is_context_overflow,
 };
-pub use profile::{Profile, ProfileSelector, ProfileSet};
+pub use profile::{Hook, Hooks, Profile, ProfileSelector, ProfileSet, Rules};
 pub use prompt::{Environment, PromptSet, PromptSource};
 pub use runner::Runner;
 pub use skill::{Skill, load_skills};

@@ -34,6 +34,13 @@ cargo run -- mcp --mcp mcp.json --allow-mcp
 
 ## Connection lifecycle
 
+- Tools are discovered at startup, which validates profiles, and listed again
+  at the start of every top-level run (its subagents share that list), so a
+  server's new or changed tools reach the next run without a restart. A
+  listing that fails, or that an interrupt ends, keeps the startup tools; each
+  server's `timeout` bounds it, outside the run's deadline. A session's server
+  process whose tools differ from the run's listing is restarted as the run
+  starts, before any call; mid-run, only a server that exited is restarted.
 - Each session connects its own server processes, kept across its messages
   until the session has been idle for 30 minutes or the server shuts down; a
   subagent's connections end with its run.
