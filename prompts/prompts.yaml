@@ -1,6 +1,7 @@
 # PromptSource::File reloads this file per run.
-# Sections marked (opencode) derive from sst/opencode @1ddb087 (MIT); the full
-# notice is in the repository LICENSE under "Third-party notices".
+# Sections marked (opencode) derive from sst/opencode @1ddb087, or the commit
+# they name (MIT); the full notice is in the repository LICENSE under
+# "Third-party notices".
 # Only validated {{name}} placeholders interpolate; single braces are literal.
 
 system:
@@ -47,53 +48,62 @@ compaction:
     Always follow the exact output structure requested by the user prompt. Keep every section, preserve exact file paths and identifiers when known, and prefer terse bullets over paragraphs.
 
     Do not continue the conversation. Do not respond to any questions in the conversation. Only output the structured summary in the exact format requested by the user prompt. Respond in the same language as the conversation.
-  # (opencode) packages/core/src/session/compaction.ts
+  # (opencode @8697644) packages/core/src/session/compaction.ts, adapted to the
+  # <conversation> and <prior-summary> framing of a separate summary request.
   template: |-
+    Summarize only what the user and the assistant said and did. Leave out instructions and setup the assistant was given rather than told by the user: repository conventions, instruction files such as AGENTS.md, and environment details like the working directory. The next agent receives current versions of all of these separately.
+
     Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
     <template>
     ## Objective
     - [one or two brief sentences describing what the user is trying to accomplish]
 
-    ## Important Details
-    - [constraints/preferences, decisions and why, important facts/assumptions, exact context needed to continue, or "(none)"]
+    ## Requirements
+    - [constraints, preferences, requirements, and scope boundaries stated by the user, or "(none)"]
+
+    ## Decisions
+    - [decisions already made and why, or "(none)"]
 
     ## Work State
+    Break the objective into smaller goals and report which are completed, which are being worked on, and which are blocked.
     ### Completed
-    - [finished work, verified facts, or changes made; otherwise "(none)"]
+    - [goals that have been completed; otherwise "(none)"]
 
     ### Active
-    - [current work, partial changes, or investigation state; otherwise "(none)"]
+    - [goals currently being worked on; otherwise "(none)"]
 
     ### Blocked
-    - [blockers, failing commands, or unknowns; otherwise "(none)"]
+    - [anything blocking progress, and why; otherwise "(none)"]
 
     ## Next Move
-    1. [immediate concrete action, or "(none)"]
-    2. [next action if known, or "(none)"]
+    1. [ordered list of next actions, or "(none)"]
 
     ## Relevant Files
-    - [file or directory path: why it matters, or "(none)"]
+    List the files and directories, other than the current working directory, that another agent would need to open to continue this work. Include at most 15, most important first. Do not list every file that was read or changed. Include paths outside the current working directory when relevant. If none, write "(none)".
+    - `[file or directory path]`: [brief reason it matters]
+
+    ## Important Context
+    - [facts the next agent cannot continue without and cannot easily find on its own; or "(none)"]
     </template>
 
     Rules:
     - Keep every section, even when empty.
-    - Use terse bullets, not prose paragraphs.
-    - Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers when known.
+    - Keep each section concise. Use terse, single-line bullets, not prose paragraphs or nested lists.
+    - Prefer short references over detailed restatement. It is fine to leave out information the next agent can recover from the code or the files listed above.
+    - Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers.
+    - Carry forward only user questions or requests that remain unanswered or require further action. Do not repeat ones that newer history has answered or resolved. Preserve exact wording when carrying one forward.
+    - Preserve consequential workflow state, including whether changes are uncommitted, committed, pushed, under review, or merged.
     - Do not mention the summary process or that context was compacted.
-  # (opencode) packages/core/src/session/compaction.ts
+  # (opencode @8697644) packages/core/src/session/compaction.ts
   update_instructions: |-
-    The <prior-summary> summarizes everything that happened before the <conversation>. Construct a new summary that combines both. The <prior-summary> is discarded after this: anything you do not carry into the new summary is lost.
+    The <prior-summary> summarizes everything that happened before the <conversation>. Update it into one consolidated summary that covers both. The <prior-summary> is discarded after this: anything you do not carry into the new summary is lost.
 
-    When combining:
-    - Carry forward objectives, constraints, user directives, decisions, and parallel workstreams from the <prior-summary> even if the <conversation> does not mention them. Drop only what is finished and no longer needed.
-    - The <conversation> is more recent than the <prior-summary>. Where they conflict, the conversation wins: state the corrected fact and drop the old claim.
-    - Add new progress, decisions, constraints, and context from the conversation.
-    - Move completed work from "Active" to "Completed".
-    - If a blocker has been resolved, update the summary to reflect that and why, and what changed.
-    - Update "Objective" and "Next Move" to reflect the current work state.
-  # (opencode) packages/core/src/session/compaction.ts
+    The <conversation> is newer and always takes precedence over the <prior-summary>. Preserve previous information unless the conversation clearly contradicts, supersedes, resolves, or makes it stale. If something is no longer relevant to continuing the work, you may remove it.
+
+    Incorporate newer requirements, decisions, progress, and context. Reconcile Work State and Next Move: move completed work out of Active, remove resolved blockers and answered questions, and preserve unresolved or pending work.
+  # (opencode @8697644) packages/core/src/session/compaction.ts
   new_summary: |-
-    Create a new anchored summary from the conversation history in the <conversation> tags above so another coding agent can continue the work.
+    You MUST summarize the conversation in the <conversation> tags above into a structured summary that will be given to another agent to resume the work.
   # (opencode) packages/core/src/session/runner/to-llm-message.ts, without <recent-context>
   checkpoint: |-
     <conversation-checkpoint>
@@ -270,25 +280,20 @@ profiles:
   general:
     description: |-
       General-purpose agent for researching complex questions and executing multi-step tasks. Use this agent to execute multiple units of work in parallel.
-  # (opencode) packages/opencode/src/agent/agent.ts and agent/prompt/explore.txt:
-  # explore has no shell here, so the Bash guideline is dropped.
+  # (opencode) packages/opencode/src/agent/agent.ts; prompt from
+  # (opencode @8697644) packages/core/src/plugin/agent.ts. Explore has no shell
+  # here, so the shell guideline is dropped.
   explore:
     description: |-
       Fast agent specialized for exploring codebases. Use this when you need to quickly find files by patterns (eg. "src/components/**/*.tsx"), search code for keywords (eg. "API endpoints"), or answer questions about the codebase (eg. "how do API endpoints work?"). When calling this agent, specify the desired thoroughness level: "quick" for basic searches, "medium" for moderate exploration, or "very thorough" for comprehensive analysis across multiple locations and naming conventions.
     prompt: |-
       You are a file search specialist. You excel at thoroughly navigating and exploring codebases.
 
-      Your strengths:
-      - Rapidly finding files using glob patterns
-      - Searching code and text with powerful regex patterns
-      - Reading and analyzing file contents
-
       Guidelines:
-      - Use Glob for broad file pattern matching
-      - Use Grep for searching file contents with regex
-      - Use Read when you know the specific file path you need to read
+      - Your role is EXCLUSIVELY to search and analyze
+      - Parallelize independent tool calls for searches and reads whenever possible
       - Adapt your search approach based on the thoroughness level specified by the caller
       - Return file paths as absolute paths in your final response
-      - For clear communication, avoid using emojis
+      - You MUST NOT create, modify, delete, move, or copy files, including temporary files and reports
 
       Complete the user's search request efficiently and report your findings clearly.

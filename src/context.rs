@@ -603,7 +603,7 @@ mod tests {
         let prompts = PromptSet::parse(crate::prompt::EMBEDDED_PROMPTS).unwrap();
         let fresh = compaction_prompt(&prompts, None, &["[User]: q1".to_owned()]);
         assert!(fresh.contains("<conversation>\n[User]: q1\n</conversation>"));
-        assert!(fresh.contains("Create a new anchored summary"));
+        assert!(fresh.contains("You MUST summarize the conversation"));
         assert!(!fresh.contains("<prior-summary>"));
 
         let merged = compaction_prompt(&prompts, Some("EARLIER"), &["[User]: q2".to_owned()]);
@@ -611,7 +611,7 @@ mod tests {
             merged.contains("<prior-summary>\nEARLIER\n</prior-summary>"),
             "{merged}"
         );
-        assert!(merged.contains("Carry forward objectives"));
+        assert!(merged.contains("Update it into one consolidated summary"));
     }
 
     #[test]

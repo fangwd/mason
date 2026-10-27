@@ -25,9 +25,9 @@ SOFTWARE.
 Third-party notices
 
 Portions of this software derive from opencode
-(https://github.com/sst/opencode @1ddb087), licensed under the MIT License:
-the prompt sections marked (opencode) in prompts/prompts.yaml, the edit
-matchers in src/tool/replace.rs, and the context-overflow patterns in
+(https://github.com/sst/opencode @1ddb087 and @8697644), licensed under the
+MIT License: the prompt sections marked (opencode) in prompts/prompts.yaml,
+the edit matchers in src/tool/replace.rs, and the context-overflow patterns in
 src/llm/error.rs.
 
 MIT License

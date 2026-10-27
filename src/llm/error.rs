@@ -91,44 +91,63 @@ pub fn retry_delay(attempt: usize, err: &LlmError) -> Duration {
     Duration::from_millis((base + base * jitter).ceil().min(BACKOFF_CAP_MS) as u64)
 }
 
-/// Context-overflow patterns derived from opencode's `llm/src/provider-error.ts`.
+/// Context-overflow patterns derived from opencode's `ai/src/provider-error.ts`.
+/// Payload-size errors stay here because the engine has no other recovery for them.
 const OVERFLOW_PATTERNS: &[&str] = &[
     "(?i)prompt is too long",
-    "(?i)request_too_large",
-    "(?i)input is too long for requested model",
+    "(?i)input is too long for (?:the )?(?:requested|selected) model",
+    // OpenCode Go
+    "(?i)too large for the model'?s configured input limit",
+    // Cloudflare Workers AI reports this as HTTP 413.
+    "(?i)exceeded this model context window limit",
     "(?i)exceeds the context window",
     "(?i)exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\\d,]+ tokens?|\\s*\\([\\d,]+\\))",
     "(?i)input token count.*exceeds the maximum",
+    // Amazon Nova on Bedrock reports this as a mid-stream validationException.
+    "(?i)number of input tokens exceeds maximum length",
     "(?i)tokens in request more than max tokens allowed",
     "(?i)maximum prompt length is \\d+",
     "(?i)reduce the length of the messages",
+    // DeepInfra
+    "(?i)requested input length \\d+ exceeds maximum input length",
     "(?i)maximum context length is \\d+ tokens",
     "(?i)exceeds (?:the )?maximum allowed input length of [\\d,]+ tokens",
-    "(?i)input \\(\\d+ tokens\\) is longer than the model'?s context length \\(\\d+ tokens\\)",
+    // Novita omits the token counts.
+    "(?i)input(?: \\(\\d+ tokens\\))? is longer than the model'?s context length",
     "(?i)exceeds the limit of \\d+",
     "(?i)exceeds the available context size",
     "(?i)greater than the context length",
+    // Hugging Face Text Generation Inference, e.g. Together
+    "(?i)`inputs` tokens \\+ `max_new_tokens` must be <= \\d+",
     "(?i)context window exceeds limit",
     "(?i)exceeded model token limit",
     "(?i)context[_ ]length[_ ]exceeded",
-    "(?i)request entity too large",
     "(?i)context length is only \\d+ tokens",
     "(?i)input length.*exceeds.*context length",
-    "(?i)prompt too long; exceeded (?:max )?context length",
+    // Z.ai code 1261 arrives as `Prompt too long`, `Prompt exceeds max length` or `Prompt 超长`.
+    "(?i)prompt (?:too long|exceeds max length|超长)",
     "(?i)too large for model with \\d+ maximum context length",
     "(?i)prompt has [\\d,]+ tokens?, but the configured context size is [\\d,]+ tokens",
     "(?i)model_context_window_exceeded",
-    "(?i)too many tokens",
-    "(?i)token limit exceeded",
     // DashScope (Qwen): "Range of input length should be [1, 98304]".
     "(?i)range of input length should be",
+    "(?i)too many tokens",
+    "(?i)token limit exceeded",
+    "(?i)request_too_large",
+    "(?i)request entity too large",
+    "(?i)payload too large",
+    "(?i)request too large",
 ];
 
-/// Throttling patterns take precedence over context-overflow matches.
+/// Throttling and output-limit patterns take precedence over context-overflow matches.
 const OVERFLOW_EXCLUSIONS: &[&str] = &[
     "(?i)^(throttling error|service unavailable):",
     "(?i)rate limit",
     "(?i)too many requests",
+    // Cohere reports an output limit above the model maximum as "too many tokens"; compaction cannot fix it.
+    "(?i)max[_ ]tokens must be less than",
+    // Bedrock phrases throttling as "Too many tokens[, per day], please wait..."; it is a 429 to retry, not overflow.
+    "(?i)too many tokens(?: per day)?, please wait",
 ];
 
 /// Whether a rendered error describes the request exceeding the model's context. The
@@ -276,6 +295,14 @@ mod tests {
             "Please reduce the length of the messages",
             "request entity too large",
             "too many tokens",
+            "Input is too long for the selected model",
+            "The input is longer than the model's context length",
+            "Prompt exceeds max length",
+            "Prompt 超长",
+            "ValidationException: The number of input tokens exceeds maximum length",
+            "requested input length 140000 exceeds maximum input length 131072",
+            "`inputs` tokens + `max_new_tokens` must be <= 32768",
+            "Payload Too Large",
         ];
         for message in positives {
             assert!(
@@ -290,6 +317,9 @@ mod tests {
             "rate limit exceeded: too many tokens",
             "Too Many Requests",
             "Throttling error: maximum context length is 8192 tokens",
+            "Too many tokens, please wait before trying again.",
+            "Too many tokens per day, please wait before trying again.",
+            "too many tokens: max_tokens must be less than 4096",
         ];
         for message in negatives {
             assert!(
