@@ -1149,7 +1149,7 @@ async fn hooks_check_each_edit_and_hold_the_finish_until_checks_pass() {
         dir.path(),
     )
     .await;
-    config.ctx = config.ctx.with_rules(Arc::new(rules(None, None)));
+    config.rules = Some(Arc::new(rules(None, None)));
     let outcome = engine::run(config).await.unwrap();
     assert_eq!(outcome.answer, "done");
     let results = tool_results(&outcome.messages);
@@ -1233,7 +1233,7 @@ async fn profile_rules_keep_bash_and_writes_to_what_they_allow() {
         .current_dir(dir.path())
         .status()
         .unwrap();
-    config.ctx = config.ctx.with_rules(Arc::new(mason::Rules {
+    config.rules = Some(Arc::new(mason::Rules {
         hooks: Default::default(),
         ..rules(Some(&["git status*"]), Some(&["crawlers/*", "notes/*"]))
     }));
@@ -1283,7 +1283,7 @@ async fn failing_checks_fail_the_run_once_repairs_are_spent() {
     )];
     replies.extend((0..4).map(|_| answer("done")));
     let (mut config, model) = config(replies, tools, dir.path()).await;
-    config.ctx = config.ctx.with_rules(Arc::new(rules(None, None)));
+    config.rules = Some(Arc::new(rules(None, None)));
     let err = engine::run(config).await.unwrap_err();
     assert!(
         err.to_string().contains("before-finish checks still fail"),
@@ -1314,7 +1314,7 @@ async fn the_final_turn_cannot_skip_failing_checks() {
     )
     .await;
     config.limits.max_steps = 1;
-    config.ctx = config.ctx.with_rules(Arc::new(rules(None, None)));
+    config.rules = Some(Arc::new(rules(None, None)));
     let err = engine::run(config).await.unwrap_err();
     assert!(
         err.to_string().contains("before-finish checks still fail"),
@@ -1340,7 +1340,7 @@ async fn hooks_get_the_authorization_of_an_ordinary_call() {
         dir.path(),
     )
     .await;
-    config.ctx = config.ctx.with_rules(Arc::new(mason::Rules {
+    config.rules = Some(Arc::new(mason::Rules {
         write_paths: Some(vec!["notes/*".into()]),
         hooks: mason::Hooks {
             after_edit: vec![hook],
@@ -1378,7 +1378,7 @@ async fn write_paths_hold_for_where_a_symlink_points() {
         dir.path(),
     )
     .await;
-    config.ctx = config.ctx.with_rules(Arc::new(mason::Rules {
+    config.rules = Some(Arc::new(mason::Rules {
         write_paths: Some(vec!["allowed/*".into()]),
         ..Default::default()
     }));
@@ -1410,7 +1410,7 @@ async fn a_parent_step_after_a_symlink_cannot_leave_write_paths() {
         dir.path(),
     )
     .await;
-    config.ctx = config.ctx.with_rules(Arc::new(mason::Rules {
+    config.rules = Some(Arc::new(mason::Rules {
         write_paths: Some(vec!["allowed/*".into()]),
         ..Default::default()
     }));
@@ -1442,7 +1442,7 @@ async fn hooks_check_the_file_a_symlink_alias_writes() {
         dir.path(),
     )
     .await;
-    config.ctx = config.ctx.with_rules(Arc::new(rules(None, None)));
+    config.rules = Some(Arc::new(rules(None, None)));
     let outcome = engine::run(config).await.unwrap();
     let results = tool_results(&outcome.messages);
     assert!(
@@ -1477,7 +1477,7 @@ async fn a_hanging_finish_check_ends_at_the_run_deadline() {
         tool: "check".into(),
         args: Default::default(),
     };
-    config.ctx = config.ctx.with_rules(Arc::new(mason::Rules {
+    config.rules = Some(Arc::new(mason::Rules {
         hooks: mason::Hooks {
             after_edit: vec![],
             before_finish: vec![hook],
@@ -1514,7 +1514,7 @@ async fn hooks_check_a_file_written_through_a_parent_step() {
         dir.path(),
     )
     .await;
-    config.ctx = config.ctx.with_rules(Arc::new(rules(None, None)));
+    config.rules = Some(Arc::new(rules(None, None)));
     let outcome = engine::run(config).await.unwrap();
     let results = tool_results(&outcome.messages);
     assert!(
@@ -1569,7 +1569,7 @@ async fn an_interrupted_hook_gets_the_cleanup_grace_of_a_call() {
         tool: "check".into(),
         args: Default::default(),
     };
-    config.ctx = config.ctx.with_rules(Arc::new(mason::Rules {
+    config.rules = Some(Arc::new(mason::Rules {
         hooks: mason::Hooks {
             after_edit: vec![],
             before_finish: vec![hook],
@@ -1599,7 +1599,7 @@ async fn hooks_run_outside_the_tool_call_budget() {
     )
     .await;
     config.limits.max_total_tool_calls = 1;
-    config.ctx = config.ctx.with_rules(Arc::new(rules(None, None)));
+    config.rules = Some(Arc::new(rules(None, None)));
     // the write took the one call; its after-edit and finish checks still run
     let outcome = engine::run(config).await.unwrap();
     assert_eq!(outcome.answer, "done");
@@ -1649,20 +1649,18 @@ async fn approval_granted_after_cancellation_starts_no_hook() {
         tool: "check".into(),
         args: Default::default(),
     };
-    config.ctx = config
-        .ctx
-        .with_execution(
-            mason::tool::policy::ExecutionMode::Trusted,
-            false,
-            Arc::new(SlowApproval),
-        )
-        .with_rules(Arc::new(mason::Rules {
-            hooks: mason::Hooks {
-                after_edit: vec![],
-                before_finish: vec![hook],
-            },
-            ..Default::default()
-        }));
+    config.ctx = config.ctx.with_execution(
+        mason::tool::policy::ExecutionMode::Trusted,
+        false,
+        Arc::new(SlowApproval),
+    );
+    config.rules = Some(Arc::new(mason::Rules {
+        hooks: mason::Hooks {
+            after_edit: vec![],
+            before_finish: vec![hook],
+        },
+        ..Default::default()
+    }));
     let err = engine::run(config).await.unwrap_err();
     assert!(matches!(err, Error::RunDeadline(_)), "{err}");
     assert_eq!(
@@ -1687,7 +1685,7 @@ async fn a_finish_check_takes_the_one_tool_slot_without_deadlock() {
     )
     .await;
     config.limits.max_concurrent_tools = 1;
-    config.ctx = config.ctx.with_rules(Arc::new(rules(None, None)));
+    config.rules = Some(Arc::new(rules(None, None)));
     let outcome = tokio::time::timeout(Duration::from_secs(10), engine::run(config)).await;
     assert_eq!(outcome.expect("no deadlock").unwrap().answer, "done");
 }

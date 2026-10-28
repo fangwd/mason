@@ -12,7 +12,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use mason::mcp::{McpServerConfig, McpServers, close_outdated, connect_config, connect_transport};
+use mason::mcp::{McpServerConfig, McpServers, connect_config, connect_transport};
 use mason::tool::policy::ExecutionMode;
 use mason::{Tool, ToolCtx};
 use rmcp::model::{
@@ -331,13 +331,17 @@ async fn failed_mcp_startup_preserves_bounded_redacted_diagnostics() {
         enabled: None,
         timeout: Some(2000),
     };
-    let error = connect_config("broken", &config, ExecutionMode::Trusted, true)
-        .await
-        .err()
-        .unwrap();
-    assert!(error.contains("failure:"), "{error}");
-    assert!(error.contains("[redacted]"), "{error}");
-    assert!(!error.contains("sensitive-fixture-secret"));
+    // A process can close the transport before its separate stderr reader gets
+    // scheduled. Repeated fast exits exercise that ordering in one test run.
+    for _ in 0..16 {
+        let error = connect_config("broken", &config, ExecutionMode::Trusted, true)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("failure:"), "{error}");
+        assert!(error.contains("[redacted]"), "{error}");
+        assert!(!error.contains("sensitive-fixture-secret"));
+    }
 }
 
 #[tokio::test]
@@ -586,80 +590,7 @@ async fn remote_handler(
 }
 
 #[tokio::test]
-async fn a_session_s_servers_older_than_the_run_s_tools_restart_as_it_starts() {
-    let marker = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-    let marker_path = marker.to_path_buf();
-    drop(marker); // absent: the first server process has the old tools
-    let configs = [(
-        "fixture".into(),
-        McpServerConfig::Local {
-            command: vec![fixture_path()],
-            cwd: None,
-            environment: Some(
-                [
-                    (
-                        "MASON_FIXTURE_LATE_TOOL".into(),
-                        marker_path.to_string_lossy().into_owned(),
-                    ),
-                    ("MASON_FIXTURE_PID".into(), "true".into()),
-                ]
-                .into(),
-            ),
-            enabled: None,
-            timeout: Some(15_000),
-        },
-    )]
-    .into();
-    let find = |servers: &McpServers, name: &str| {
-        servers
-            .tools()
-            .into_iter()
-            .find(|tool| tool.spec().function.name == name)
-            .unwrap()
-    };
-    let scope = ctx();
-    let before = McpServers::connect(&configs, ExecutionMode::Trusted, true).await;
-    let first = find(&before, "fixture_echo")
-        .call(json!({"text": "pid"}), &scope)
-        .await
-        .unwrap();
-
-    // the code changes: a new tool, and echo redescribed
-    std::fs::write(&marker_path, "").unwrap();
-    let after = McpServers::connect(&configs, ExecutionMode::Trusted, true).await;
-    let late = find(&after, "fixture_late");
-    // mid-run, the session's server is left alone: calls in flight on it go on
-    assert!(late.call(json!({}), &scope).await.is_err());
-    assert_eq!(
-        find(&after, "fixture_echo")
-            .call(json!({"text": "pid"}), &scope)
-            .await
-            .unwrap(),
-        first
-    );
-
-    // the next run starts it again, with the new tools
-    close_outdated(&scope.scope(), &after.tools()).await;
-    assert_eq!(late.call(json!({}), &scope).await.unwrap(), "late");
-    let second = find(&after, "fixture_echo")
-        .call(json!({"text": "pid"}), &scope)
-        .await
-        .unwrap();
-    assert_ne!(first, second);
-    // and a run whose tools match keeps it
-    close_outdated(&scope.scope(), &after.tools()).await;
-    assert_eq!(
-        find(&after, "fixture_echo")
-            .call(json!({"text": "pid"}), &scope)
-            .await
-            .unwrap(),
-        second
-    );
-    std::fs::remove_file(&marker_path).unwrap();
-}
-
-#[tokio::test]
-async fn a_connection_newer_than_the_run_s_listing_is_kept() {
+async fn calls_do_not_restart_a_server_whose_tools_changed_since_the_listing() {
     let marker = tempfile::NamedTempFile::new().unwrap().into_temp_path();
     let marker_path = marker.to_path_buf();
     drop(marker);

@@ -520,6 +520,7 @@ pub async fn config(
             .load()
             .expect("the embedded prompts are valid"),
         ctx: ToolCtx::new(cwd).with_spill(Arc::new(OutputSpill::new(cwd.join("spill")))),
+        rules: None,
         limits: mason::Limits::default(),
         messages: vec![Message::user("go")],
         run_id: None,

@@ -62,10 +62,33 @@ pub struct ToolCtx {
     pub execution_mode: policy::ExecutionMode,
     pub allow_network: bool,
     pub policy: Arc<dyn policy::ToolPolicy>,
-    /// The running profile's limits on `bash`, `write` and `edit`, and its hooks.
-    pub rules: Option<Arc<crate::profile::Rules>>,
+    /// Current run's permissions and edit journal, inherited by delegated runs.
+    pub(crate) access: Option<Arc<RunAccess>>,
     /// Per-session resource scope; different sessions and children never share MCP state.
     pub resources: Arc<std::sync::Mutex<HashMap<String, Arc<dyn std::any::Any + Send + Sync>>>>,
+}
+
+/// A run's tools, constraints and edits. Children retain their parent's journal
+/// so its finish checks cover delegated edits, even when a child fails.
+pub struct RunAccess {
+    pub(crate) tools: Arc<Toolset>,
+    pub(crate) rules: Option<Arc<crate::profile::Rules>>,
+    pub(crate) edited: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    pub(crate) parent: Option<Arc<RunAccess>>,
+}
+
+impl std::fmt::Debug for RunAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunAccess")
+            .field("rules", &self.rules)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RunAccess {
+    pub(crate) fn ancestors(&self) -> impl Iterator<Item = &Self> {
+        std::iter::successors(Some(self), |access| access.parent.as_deref())
+    }
 }
 
 /// Background processes and MCP connections that outlive one run: a stored
@@ -110,7 +133,7 @@ impl ToolCtx {
             execution_mode: policy::ExecutionMode::Trusted,
             allow_network: false,
             policy: Arc::new(policy::AllowTools),
-            rules: None,
+            access: None,
             resources: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -129,10 +152,12 @@ impl ToolCtx {
         self
     }
 
-    /// Sets the running profile's rules.
-    pub fn with_rules(mut self, rules: Arc<crate::profile::Rules>) -> Self {
-        self.rules = Some(rules);
-        self
+    /// Why this run or one of its ancestors refuses `name` with `args`, if any does.
+    pub(crate) fn check_rules(&self, name: &str, args: &Value) -> Option<String> {
+        self.access
+            .as_ref()?
+            .ancestors()
+            .find_map(|access| access.rules.as_ref()?.check(name, args, &self.cwd))
     }
 
     /// Sets the cancellation token (a child of the run's token).

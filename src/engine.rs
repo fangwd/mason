@@ -164,6 +164,8 @@ pub struct RunConfig {
     pub prompts: Arc<PromptSet>,
     /// Prototype context for tool calls; the run installs its own token.
     pub ctx: ToolCtx,
+    /// The running profile's limits on `bash`, `write` and `edit`, and its hooks.
+    pub rules: Option<Arc<crate::profile::Rules>>,
     /// Limits for this run.
     pub limits: Limits,
     /// The conversation so far: a system message, then user/assistant turns.
@@ -293,9 +295,6 @@ struct RunShared {
     /// Spill files of oversized tool results, by tool call id; the view is
     /// rebuilt every step but each result is saved once.
     spilled: StdMutex<HashMap<String, PathBuf>>,
-    /// Files this run wrote or edited, relative to the working directory, for
-    /// the profile's before-finish checks.
-    edited: StdMutex<std::collections::BTreeSet<String>>,
 }
 
 impl RunShared {
@@ -403,7 +402,8 @@ async fn run_loop(
         model,
         tools,
         prompts,
-        ctx,
+        mut ctx,
+        rules,
         messages,
         run_id,
         events,
@@ -413,6 +413,12 @@ async fn run_loop(
         max_tokens,
         ..
     } = config;
+    ctx.access = Some(Arc::new(crate::tool::RunAccess {
+        tools: tools.clone(),
+        rules,
+        edited: StdMutex::new(Default::default()),
+        parent: ctx.access.take(),
+    }));
     let specs = tools.specs();
     let spec_json = serde_json::to_string(&specs).unwrap_or_default();
     let spec_tokens = estimate_str(&spec_json);
@@ -430,7 +436,6 @@ async fn run_loop(
         persist,
         run_id,
         spilled: StdMutex::new(HashMap::new()),
-        edited: StdMutex::new(Default::default()),
     });
     let mut finish_checks = 0;
     let mut usage: Option<Usage> = None;
@@ -627,12 +632,13 @@ const MAX_FINISH_CHECKS: usize = 3;
 /// Runs a profile hook on one edited file: whether it passed, and its output.
 async fn run_hook(
     shared: &RunShared,
+    access: &crate::tool::RunAccess,
     hook: &crate::profile::Hook,
     path: &str,
 ) -> Result<(bool, String)> {
     // an interrupt or the run deadline ends a hook like any step: after the
     // cleanup grace an ordinary call gets
-    let call = hook_call(shared, hook, path);
+    let call = hook_call(shared, access, hook, path);
     tokio::pin!(call);
     tokio::select! {
         result = &mut call => result,
@@ -645,10 +651,11 @@ async fn run_hook(
 
 async fn hook_call(
     shared: &RunShared,
+    access: &crate::tool::RunAccess,
     hook: &crate::profile::Hook,
     path: &str,
 ) -> Result<(bool, String)> {
-    let Some(tool) = shared.tools.get(&hook.tool) else {
+    let Some(tool) = access.tools.get(&hook.tool) else {
         return Ok((
             false,
             format!("the {} tool is not available to this run", hook.tool),
@@ -664,11 +671,7 @@ async fn hook_call(
             ToolError::Fatal(err) => Err(err),
         };
     }
-    if let Some(denied) = ctx
-        .rules
-        .as_ref()
-        .and_then(|rules| rules.check(&hook.tool, &args, &ctx.cwd))
-    {
+    if let Some(denied) = ctx.check_rules(&hook.tool, &args) {
         return Ok((false, format!("permission denied: {denied}")));
     }
     // a run cancelled while the call waited for approval starts no tool in its grace
@@ -684,10 +687,11 @@ async fn hook_call(
 
 /// The failed before-finish checks of the files this run edited, if any failed.
 async fn before_finish(shared: &RunShared) -> Result<Option<String>> {
-    let Some(rules) = shared.ctx.rules.clone() else {
+    let access = shared.ctx.access.as_ref().expect("run access");
+    let Some(rules) = &access.rules else {
         return Ok(None);
     };
-    let edited: Vec<String> = shared
+    let edited: Vec<String> = access
         .edited
         .lock()
         .expect("edited files")
@@ -709,7 +713,7 @@ async fn before_finish(shared: &RunShared) -> Result<Option<String>> {
                 }),
                 None => None,
             };
-            let (passed, output) = run_hook(shared, hook, path).await?;
+            let (passed, output) = run_hook(shared, access, hook, path).await?;
             if !passed {
                 failures.push(format!("{} on {path}:\n{output}", hook.tool));
             }
@@ -729,22 +733,24 @@ async fn before_finish(shared: &RunShared) -> Result<Option<String>> {
 
 /// The after-edit hook results for a file a `write` or `edit` just changed.
 async fn after_edit(shared: &RunShared, path: &str) -> Result<String> {
-    let Some(rules) = shared.ctx.rules.clone() else {
-        return Ok(String::new());
-    };
     let mut notes = String::new();
-    for hook in rules
-        .hooks
-        .after_edit
-        .iter()
-        .filter(|hook| crate::profile::glob_match(&hook.pattern, path))
-    {
-        let (passed, output) = run_hook(shared, hook, path).await?;
-        let verdict = if passed { "passed" } else { "FAILED" };
-        notes.push_str(&format!(
-            "\n\n[{} on {path} after this edit: {verdict}]\n{output}",
-            hook.tool
-        ));
+    for access in shared.ctx.access.as_ref().expect("run access").ancestors() {
+        let Some(rules) = &access.rules else {
+            continue;
+        };
+        for hook in rules
+            .hooks
+            .after_edit
+            .iter()
+            .filter(|hook| crate::profile::glob_match(&hook.pattern, path))
+        {
+            let (passed, output) = run_hook(shared, access, hook, path).await?;
+            let verdict = if passed { "passed" } else { "FAILED" };
+            notes.push_str(&format!(
+                "\n\n[{} on {path} after this edit: {verdict}]\n{output}",
+                hook.tool
+            ));
+        }
     }
     Ok(notes)
 }
@@ -1100,9 +1106,7 @@ async fn call_tool(
             }
         }
     }
-    if let Some(rules) = &ctx.rules
-        && let Some(denied) = rules.check(name, &args, &ctx.cwd)
-    {
+    if let Some(denied) = ctx.check_rules(name, &args) {
         return Ok(format!("Error: permission denied: {denied}"));
     }
     let edited = matches!(name.as_str(), "write" | "edit")
@@ -1115,11 +1119,13 @@ async fn call_tool(
             if let Some(path) =
                 edited.and_then(|path| crate::profile::written_file(&ctx.cwd, &path))
             {
-                shared
-                    .edited
-                    .lock()
-                    .expect("edited files")
-                    .insert(path.clone());
+                for access in ctx.access.as_ref().expect("run access").ancestors() {
+                    access
+                        .edited
+                        .lock()
+                        .expect("edited files")
+                        .insert(path.clone());
+                }
                 output.push_str(&after_edit(shared, &path).await?);
             }
             match shared.ctx.spill.truncate(&output, Keep::Head).await {

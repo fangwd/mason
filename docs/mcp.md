@@ -34,13 +34,22 @@ cargo run -- mcp --mcp mcp.json --allow-mcp
 
 ## Connection lifecycle
 
-- Tools are discovered at startup, which validates profiles, and listed again
-  at the start of every top-level run (its subagents share that list), so a
-  server's new or changed tools reach the next run without a restart. A
-  listing that fails, or that an interrupt ends, keeps the startup tools; each
-  server's `timeout` bounds it, outside the run's deadline. A session's server
-  process whose tools differ from the run's listing is restarted as the run
-  starts, before any call; mid-run, only a server that exited is restarted.
+- Tools are discovered at startup to validate profiles. Each top-level run
+  refreshes servers whose namespaces its profile could use; its subagents share
+  that listing. Exact tool lists and namespace-wide denials skip unrelated
+  servers; globs conservatively include namespaces that could gain matching tools.
+- Refresh lists tools over the session's existing connections, opening missing
+  connections once for both listing and calls. Up to eight servers refresh
+  concurrently within one budget: at most five seconds or 10% of the run timeout,
+  whichever is smaller. Listing time counts toward the run timeout. Interrupts
+  cancel discovery too.
+- Each failed or unfinished server keeps its last successful listing; successful
+  updates from other servers are retained. Failures and timeouts are logged.
+  A cached tool can still fail when called if its server remains unavailable.
+- Changes a running server reports through `tools/list` reach the next run.
+  Updating a local server's executable requires restarting its process (for
+  example by restarting `mason serve`); refresh does not reload executable code
+  or discard a live server's in-memory state.
 - Each session connects its own server processes, kept across its messages
   until the session has been idle for 30 minutes or the server shuts down; a
   subagent's connections end with its run.

@@ -15,6 +15,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::{StreamExt, stream};
 use http::{HeaderName, HeaderValue};
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientRequest,
@@ -199,6 +200,162 @@ impl McpServers {
     }
 }
 
+/// Per-server last successful listings. Refreshes use the session's connections,
+/// so listing and calling a tool do not start separate server processes.
+pub(crate) struct McpRefresh {
+    configs: BTreeMap<String, McpServerConfig>,
+    mode: crate::tool::policy::ExecutionMode,
+    network: bool,
+    cached: std::sync::Mutex<BTreeMap<String, Vec<Arc<dyn Tool>>>>,
+}
+
+impl McpRefresh {
+    pub(crate) fn new(
+        configs: BTreeMap<String, McpServerConfig>,
+        mode: crate::tool::policy::ExecutionMode,
+        network: bool,
+        tools: &[Arc<dyn Tool>],
+    ) -> Self {
+        let cached = configs
+            .keys()
+            .map(|server| {
+                (
+                    server.clone(),
+                    tools
+                        .iter()
+                        .filter(|tool| tool.mcp_server() == Some(server.as_str()))
+                        .cloned()
+                        .collect(),
+                )
+            })
+            .collect();
+        Self {
+            configs,
+            mode,
+            network,
+            cached: std::sync::Mutex::new(cached),
+        }
+    }
+
+    pub(crate) async fn refresh(
+        &self,
+        profile: &crate::profile::Profile,
+        scope: &crate::tool::ToolScope,
+        timeout: Duration,
+    ) -> Vec<Arc<dyn Tool>> {
+        let selected: Vec<_> = self
+            .configs
+            .iter()
+            .filter(|(name, config)| config.enabled() && may_use_server(profile, name))
+            .map(|(name, config)| (name.clone(), config.clone()))
+            .collect();
+        let listing = stream::iter(selected.clone())
+            .map(|(name, config)| async move {
+                match self.refresh_server(scope, &name, &config).await {
+                    Ok(tools) => {
+                        self.cached
+                            .lock()
+                            .expect("MCP listings")
+                            .insert(name.clone(), tools);
+                    }
+                    Err(error) => tracing::warn!(
+                        "keeping the last successful MCP listing for {name}: {error}"
+                    ),
+                }
+            })
+            .buffer_unordered(8)
+            .collect::<Vec<_>>();
+        if tokio::time::timeout(timeout, listing).await.is_err() {
+            tracing::warn!(
+                "MCP refresh timed out; keeping each unfinished server's last successful listing"
+            );
+        }
+        let cached = self.cached.lock().expect("MCP listings");
+        selected
+            .iter()
+            .flat_map(|(name, _)| cached.get(name).into_iter().flatten().cloned())
+            .collect()
+    }
+
+    async fn refresh_server(
+        &self,
+        scope: &crate::tool::ToolScope,
+        name: &str,
+        config: &McpServerConfig,
+    ) -> std::result::Result<Vec<Arc<dyn Tool>>, String> {
+        let cell = scoped_connection(scope, name);
+        let mut connection = cell.lock().await;
+        if connection.as_ref().is_some_and(McpConnection::is_closed)
+            && let Some(closed) = connection.take()
+        {
+            let _ = tokio::time::timeout(crate::engine::CLEANUP_GRACE, closed.close()).await;
+        }
+        if let Some(open) = connection.as_mut() {
+            let listed = discover(&open.client, config.timeout()).await?;
+            open.tools = listed
+                .into_iter()
+                .map(|tool| {
+                    Arc::new(McpTool::new(name, tool, open.client.peer().clone())) as Arc<dyn Tool>
+                })
+                .collect();
+        } else {
+            *connection = Some(connect_config(name, config, self.mode, self.network).await?);
+        }
+        Ok(connection
+            .as_ref()
+            .expect("connected")
+            .tools()
+            .iter()
+            .map(|tool| {
+                Arc::new(ScopedMcpTool {
+                    spec: tool.spec(),
+                    read_only: tool.read_only(),
+                    server: name.into(),
+                    config: config.clone(),
+                    mode: self.mode,
+                    network: self.network,
+                }) as Arc<dyn Tool>
+            })
+            .collect())
+    }
+}
+
+/// Conservative namespace overlap: refresh globs that could admit a new tool,
+/// but do not contact servers excluded by exact lists or a namespace-wide deny.
+fn may_use_server(profile: &crate::profile::Profile, server: &str) -> bool {
+    let prefix = format!("{}_", sanitize(server));
+    if profile
+        .deny
+        .iter()
+        .any(|pattern| pattern.ends_with('*') && crate::profile::glob_match(pattern, &prefix))
+    {
+        return false;
+    }
+    profile.tools.as_ref().is_none_or(|entries| {
+        entries.iter().any(|entry| {
+            if let Some((head, _)) = entry.split_once('*') {
+                prefix.starts_with(head) || head.starts_with(&prefix)
+            } else {
+                entry.starts_with(&prefix) && profile.admits(entry, false)
+            }
+        })
+    })
+}
+
+type ScopedConnection = tokio::sync::Mutex<Option<McpConnection>>;
+
+fn scoped_connection(scope: &crate::tool::ToolScope, server: &str) -> Arc<ScopedConnection> {
+    scope
+        .resources
+        .lock()
+        .expect("tool resource mutex")
+        .entry(format!("mcp:{server}"))
+        .or_insert_with(|| Arc::new(ScopedConnection::new(None)))
+        .clone()
+        .downcast::<ScopedConnection>()
+        .expect("MCP scope resource")
+}
+
 /// Connects and discovers tools under deadlines, closing the transport on failure.
 pub async fn connect_config(
     name: &str,
@@ -290,8 +447,8 @@ async fn serve_config(
                 .stderr(Stdio::piped())
                 .spawn()
                 .map_err(|err| err.to_string())?;
-            let group = GroupGuard::new(transport.id());
-            if let Some(mut stderr) = stderr {
+            let mut group = GroupGuard::new(transport.id());
+            let stderr_reader = stderr.map(|mut stderr| {
                 let diagnostics = diagnostics.clone();
                 tokio::spawn(async move {
                     use tokio::io::AsyncReadExt;
@@ -305,11 +462,22 @@ async fn serve_config(
                         let excess = tail.len().saturating_sub(4096);
                         tail.drain(..excess);
                     }
-                });
-            }
+                })
+            });
             match ().serve(transport).await {
                 Ok(client) => Ok((client, isolated._scratch, Some(group))),
                 Err(error) => {
+                    // The transport can fail on a broken pipe before the reader has
+                    // drained the server's stderr. Stop the process, then wait a
+                    // bounded time for the reader before taking its diagnostic tail.
+                    group.kill();
+                    if let Some(mut reader) = stderr_reader
+                        && tokio::time::timeout(Duration::from_millis(500), &mut reader)
+                            .await
+                            .is_err()
+                    {
+                        reader.abort();
+                    }
                     let mut tail = String::from_utf8_lossy(
                         &diagnostics.lock().expect("MCP diagnostics mutex"),
                     )
@@ -407,46 +575,6 @@ pub(crate) async fn close_scope(
     }
 }
 
-/// Closes the scope's server connections whose tools differ from `listed`, the
-/// run's fresh listing: a session's server process that predates a new or
-/// changed tool. Called as a run starts, before it dispatches any call; the
-/// next call starts the server again.
-pub async fn close_outdated(scope: &crate::tool::ToolScope, listed: &[Arc<dyn Tool>]) {
-    let connections: Vec<_> = scope
-        .resources
-        .lock()
-        .expect("tool resource mutex")
-        .iter()
-        .filter_map(|(key, value)| {
-            let server = key.strip_prefix("mcp:")?;
-            let connection = value
-                .clone()
-                .downcast::<tokio::sync::Mutex<Option<McpConnection>>>()
-                .ok()?;
-            Some((server.to_owned(), connection))
-        })
-        .collect();
-    for (server, connection) in connections {
-        let mut connection = connection.lock().await;
-        let Some(open) = connection.as_ref() else {
-            continue;
-        };
-        let mut had: Vec<_> = open.tools().iter().map(|tool| tool.spec()).collect();
-        let mut has: Vec<_> = listed
-            .iter()
-            .filter(|tool| tool.mcp_server() == Some(server.as_str()))
-            .map(|tool| tool.spec())
-            .collect();
-        had.sort_by(|a, b| a.function.name.cmp(&b.function.name));
-        has.sort_by(|a, b| a.function.name.cmp(&b.function.name));
-        if had != has
-            && let Some(outdated) = connection.take()
-        {
-            let _ = tokio::time::timeout(crate::engine::CLEANUP_GRACE, outdated.close()).await;
-        }
-    }
-}
-
 /// A new connection for each run/child, shared only by tools in that scope.
 struct ScopedMcpTool {
     spec: ToolSpec,
@@ -469,16 +597,7 @@ impl Tool for ScopedMcpTool {
         Some(&self.server)
     }
     async fn call(&self, args: Value, ctx: &ToolCtx) -> std::result::Result<String, ToolError> {
-        type Connection = tokio::sync::Mutex<Option<McpConnection>>;
-        let connection = {
-            let mut resources = ctx.resources.lock().expect("tool resource mutex");
-            resources
-                .entry(format!("mcp:{}", self.server))
-                .or_insert_with(|| Arc::new(Connection::new(None)))
-                .clone()
-                .downcast::<Connection>()
-                .expect("MCP scope type")
-        };
+        let connection = scoped_connection(&ctx.scope(), &self.server);
         // The lock only covers connecting; calls to one server run concurrently.
         let tool = {
             let mut connection = connection.lock().await;
@@ -497,10 +616,8 @@ impl Tool for ScopedMcpTool {
                         .cloned()
                 })
             };
-            // A server that went away since the last call is started again. One that
-            // predates the run's listing was closed when the run started
-            // (`close_outdated`), so an open connection is as new as the listing or
-            // newer, and calls in flight on it are never cut off.
+            // Refresh updates the session's listing before dispatch. During a run
+            // only a dead connection is restarted; calls in flight are left alone.
             if connection.as_ref().is_some_and(McpConnection::is_closed)
                 && let Some(closed) = connection.take()
             {
@@ -515,8 +632,8 @@ impl Tool for ScopedMcpTool {
             }
             find(&connection).ok_or_else(|| {
                 ToolError::failure(
-                    "this session's MCP server does not offer this tool; a server older than \
-                         the run's tools starts again with the next run",
+                    "this session's MCP server does not offer this tool; its listing will \
+                         be refreshed with the next run",
                 )
             })?
         };
@@ -721,6 +838,38 @@ fn json_type(value: &Value) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn refresh_skips_namespaces_the_profile_cannot_use() {
+        let mut profile = crate::profile::Profile::new("p", "");
+        assert!(may_use_server(&profile, "acme"));
+        profile.tools = Some(vec!["read".into(), "task".into()]);
+        assert!(!may_use_server(&profile, "acme"));
+        profile.tools = Some(vec!["acme_query".into()]);
+        assert!(may_use_server(&profile, "acme"));
+        assert!(!may_use_server(&profile, "other"));
+        profile.read_only = true;
+        assert!(
+            may_use_server(&profile, "acme"),
+            "an exact-name override still works"
+        );
+        profile.tools = Some(vec!["acme_new*".into()]);
+        assert!(
+            may_use_server(&profile, "acme"),
+            "a new matching tool can appear"
+        );
+        profile.tools = Some(vec!["*_query".into()]);
+        assert!(may_use_server(&profile, "other"));
+        profile.deny = vec!["acme_*".into()];
+        assert!(!may_use_server(&profile, "acme"));
+        assert!(may_use_server(&profile, "other"));
+        profile.deny.clear();
+        profile.tools = Some(vec!["my_files_*".into()]);
+        assert!(
+            may_use_server(&profile, "my files"),
+            "server namespaces are sanitized"
+        );
+    }
 
     #[test]
     fn sanitize_replaces_unsafe_characters() {

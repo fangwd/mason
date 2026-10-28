@@ -40,6 +40,16 @@ impl ServerHandler for Fixture {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        if std::env::var_os("MASON_FIXTURE_FAIL_LISTING")
+            .is_some_and(|marker| std::path::Path::new(&marker).exists())
+        {
+            return Err(ErrorData::internal_error("listing failed", None));
+        }
+        if std::env::var_os("MASON_FIXTURE_SLOW_LISTING")
+            .is_some_and(|marker| std::path::Path::new(&marker).exists())
+        {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
         // after a "code change" (the marker file), `late` appears and `echo` is redescribed
         let changed = std::env::var_os("MASON_FIXTURE_LATE_TOOL")
             .is_some_and(|marker| std::path::Path::new(&marker).exists());
@@ -115,6 +125,17 @@ impl ServerHandler for Fixture {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(path) = std::env::var_os("MASON_FIXTURE_STARTS") {
+        use std::io::Write;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?,
+            "{}",
+            std::process::id()
+        )?;
+    }
     let service = Fixture
         .serve((tokio::io::stdin(), tokio::io::stdout()))
         .await?;

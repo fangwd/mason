@@ -265,7 +265,13 @@ pub fn relative_path(cwd: &std::path::Path, path: &str) -> Option<String> {
     let full = parts.iter().fold(base, |path, part| path.join(part));
     full.strip_prefix(cwd)
         .ok()
-        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .map(|relative| {
+            relative
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
         .filter(|relative| !relative.is_empty())
 }
 
@@ -630,6 +636,8 @@ pub struct SubagentRequest {
     /// The parent's cancellation token: children live and die with it.
     pub token: CancellationToken,
     pub budget: Option<Arc<crate::engine::RunBudget>>,
+    /// Parent permissions and edit journal; supplied by the runtime task tool.
+    pub access: Option<Arc<crate::tool::RunAccess>>,
 }
 
 /// What a finished child run returns. Stored child sessions carry an id; in-memory
@@ -749,6 +757,7 @@ impl ToolTrait for TaskTool {
             prompt,
             token: ctx.token.clone(),
             budget: ctx.budget.clone(),
+            access: ctx.access.clone(),
         })
         .await
         .map_err(|err| match err {

@@ -70,11 +70,14 @@ hold only when they are operated this way:
   check in an MCP tool that fails with an error.
 - **Hooks are called like ordinary tool calls** (host policy and profile rules
   apply) and only on `write` and `edit`; a file changed another way is not checked.
+- **Delegation retains the parent's restrictions.** A child gets only tools both
+  profiles allow, and both profiles' shell and path rules apply. Parent edit
+  hooks also cover child edits, including edits left by a failed child.
 - **Restart `mason serve` after changing `agent.yaml`.** Profiles, rules and hooks
-  are read at startup. MCP *tools* need no restart: every run lists them again,
-  and a session's server process whose tools differ from a run's listing is
-  restarted as that run starts (never mid-run), losing the process's in-memory
-  state.
+  are read at startup. MCP tool lists refresh over existing session connections;
+  unrelated servers are skipped and failed listings retain their last successful
+  tools. Restart local MCP processes after updating their executable: listing
+  tools does not reload server code. See [the connection lifecycle](docs/mcp.md#connection-lifecycle).
 
 ## Development
 

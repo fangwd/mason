@@ -80,6 +80,8 @@ A manifest carries:
     globs away. With `read_only: true` a glob admits only tools that declare
     themselves read-only (MCP's `readOnlyHint`; the builtin `read`, `grep` and
     `glob`), while a tool listed by exact name is taken as given.
+    Delegation intersects the child's tools with the parent's effective tools;
+    a child cannot regain a tool excluded by its parent.
   - `shell` lists the command globs `bash` may run (`git -C repo status*`); an
     allowed command may not chain or redirect (`; & | $ \` ( ) < >`, newline).
     `write_paths` lists the path globs, relative to the working directory,
@@ -87,6 +89,8 @@ A manifest carries:
     (symlinks followed; a path with `..` is refused). Both are unrestricted when omitted. MCP tools are
     outside them: restrict those with `tools`/`deny`. See the README's
     "Operating profile rules".
+    Children must obey both profiles' shell and path rules. On Unix, a literal
+    backslash in a filename remains a backslash, rather than a directory separator.
   - `hooks` run a tool around edits: `after_edit` after each successful `write`
     or `edit` of a matching file, its result appended to the edit's output;
     `before_finish` on every matching file the run edited, before the run may
@@ -101,11 +105,14 @@ A manifest carries:
       after_edit: [{match: "crawlers/*.ts", tool: acme_check, args: {file: "{path}"}}]
       before_finish: [{match: "crawlers/*.ts", tool: acme_check, args: {file: "{path}"}}]
     ```
+    Parent `after_edit` hooks also run on child edits. Parent `before_finish`
+    checks include files edited by children, even if a child failed. Each child's
+    own finish checks cover only its own edits.
 - `select_profile` — rules choosing a profile from a session's opaque
   `metadata`. Conditions are ANDed, the first matching rule wins, and
   `present` means the path exists and is not null.
-- `mcp` servers (or an `mcp_file`), whose tools every top-level run lists
-  again, so a server's new or changed tools need no restart, plus the execution grants
+- `mcp` servers (or an `mcp_file`), whose tool lists refresh on existing session
+  connections for servers the profile could use ([connection lifecycle](mcp.md#connection-lifecycle)), plus the execution grants
   `execution_mode` (default `trusted`), `allow_network` and `allow_mcp`
   (both fail closed).
 - Optionally `prompts`, `skills_dir`, `memory_dir`, `limits`, `spill` and `cwd`. Relative

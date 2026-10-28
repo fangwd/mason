@@ -1049,17 +1049,15 @@ impl AgentSpec {
     ) -> Result<AgentBuilder> {
         #[cfg(feature = "mcp")]
         if self.has_mcp() && self.allow_mcp {
-            let configs = self.mcp_configs()?;
-            let (mode, network) = (self.execution_mode, self.allow_network);
-            let refresh: crate::agent::ToolRefresh = Arc::new(move || {
-                let configs = configs.clone();
-                Box::pin(async move {
-                    let servers = crate::mcp::McpServers::connect(&configs, mode, network).await;
-                    match servers.failures() {
-                        [] => Ok(servers.tools()),
-                        failures => Err(failures.join("; ")),
-                    }
-                })
+            let catalog = Arc::new(crate::mcp::McpRefresh::new(
+                self.mcp_configs()?,
+                self.execution_mode,
+                self.allow_network,
+                &tools,
+            ));
+            let refresh: crate::agent::ToolRefresh = Arc::new(move |profile, scope, timeout| {
+                let catalog = catalog.clone();
+                Box::pin(async move { Ok(catalog.refresh(&profile, &scope, timeout).await) })
             });
             return Ok(builder.refreshing_tools(tools, refresh));
         }
