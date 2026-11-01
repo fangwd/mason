@@ -367,6 +367,9 @@ pub fn subprocess(
     }
 }
 
+/// Set on the tool worker when the run may not `read` the file being edited.
+pub const WORKER_NO_READ_ENV: &str = "MASON_WORKER_NO_READ";
+
 /// Isolate Rust filesystem tools too, rather than relying on path checks alone.
 pub struct IsolatedFileTool(pub Arc<dyn Tool>);
 #[async_trait::async_trait]
@@ -392,11 +395,16 @@ impl Tool for IsolatedFileTool {
         };
         let mut isolated = subprocess(
             executable.to_string_lossy().as_ref(),
-            &["tool-worker".into(), name],
+            &["tool-worker".into(), name.clone()],
             &ctx.cwd,
             ExecutionMode::Sandbox,
             false,
         )?;
+        // The worker has no run access or policy, so the edit-hint decision is
+        // made here.
+        if name == "edit" && !ctx.may_read(&args).await? {
+            isolated.command.env(WORKER_NO_READ_ENV, "1");
+        }
         isolated
             .command
             .stdin(std::process::Stdio::piped())

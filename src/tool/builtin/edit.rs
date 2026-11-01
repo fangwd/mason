@@ -82,15 +82,108 @@ impl TypedTool for EditTool {
             ..
         } = args;
         // The fuzzy matchers are CPU-bound: keep them off the async workers.
-        let updated = tokio::task::spawn_blocking(move || {
-            replace_keeping_line_endings(&content, &old_string, &new_string, replace_all)
+        let (result, content, old_string, new_string) = tokio::task::spawn_blocking(move || {
+            let result =
+                replace_keeping_line_endings(&content, &old_string, &new_string, replace_all);
+            (result, content, old_string, new_string)
         })
         .await
-        .map_err(|err| ToolError::failure(format!("the edit worker failed: {err}")))?
-        .map_err(|err| ToolError::failure(err.to_string()))?;
+        .map_err(|err| ToolError::failure(format!("the edit worker failed: {err}")))?;
+        let updated = match result {
+            Ok(updated) => updated,
+            Err(err) => {
+                let mut message = err.to_string();
+                // Miss hints quote file lines, so they need the run's `read` access.
+                if matches!(err, replace::ReplaceError::NotFound)
+                    && ctx
+                        .may_read(&serde_json::json!({"filePath": args.file_path}))
+                        .await?
+                    && let Some(hint) = tokio::task::spawn_blocking(move || {
+                        miss_hint(&content, &old_string, &new_string)
+                    })
+                    .await
+                    .map_err(|err| ToolError::failure(format!("the edit worker failed: {err}")))?
+                {
+                    message.push_str("\n\n");
+                    message.push_str(&hint);
+                }
+                return Err(ToolError::failure(message));
+            }
+        };
         super::write::write_file(&path, &updated).await?;
         Ok(format!("Edited {}", path.display()))
     }
+}
+
+/// Diagnostic only; adapted from opencode @84f66054. Never widens a match.
+fn miss_hint(content: &str, old: &str, new: &str) -> Option<String> {
+    use std::collections::HashMap;
+
+    let normalize = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if new.trim().chars().count() >= 20 && normalize(content).contains(&normalize(new)) {
+        return Some(
+            "newString is already in the file, so this edit may already be applied.".into(),
+        );
+    }
+    let lines: Vec<_> = content.lines().collect();
+    let search: Vec<_> = old.lines().collect();
+    let mut positions: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, line) in lines.iter().enumerate() {
+        let key = normalize(line);
+        if key.chars().any(char::is_alphanumeric) {
+            positions.entry(key).or_default().push(index);
+        }
+    }
+    let mut votes: HashMap<isize, usize> = HashMap::new();
+    let mut wanted = 0;
+    let mut comparisons = 0usize;
+    for (offset, line) in search.iter().enumerate() {
+        let key = normalize(line);
+        if !key.chars().any(char::is_alphanumeric) {
+            continue;
+        }
+        wanted += 1;
+        if let Some(indices) = positions.get(&key) {
+            comparisons = comparisons.saturating_add(indices.len());
+            if comparisons > 100_000 {
+                return None;
+            }
+            for &index in indices {
+                *votes.entry(index as isize - offset as isize).or_default() += 1;
+            }
+        }
+    }
+    let (&start, &count) = votes
+        .iter()
+        .max_by_key(|&(start, count)| (*count, -start))?;
+    if count * 2 < wanted {
+        return None;
+    }
+    let matched: Vec<usize> = search
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, line)| {
+            let index = start + offset as isize;
+            (index >= 0
+                && (index as usize) < lines.len()
+                && !normalize(line).is_empty()
+                && normalize(line) == normalize(lines[index as usize]))
+            .then_some(index as usize)
+        })
+        .collect();
+    let from = *matched.first()?;
+    let to = (matched.last()? + 1).min(from + 12);
+    let mut result = String::from("The closest lines in the file:");
+    for (index, line) in lines[from..to].iter().enumerate() {
+        let preview: String = line.chars().take(200).collect();
+        let suffix = if line.chars().count() > 200 {
+            "…"
+        } else {
+            ""
+        };
+        result.push_str(&format!("\n{}: {preview}{suffix}", from + index + 1));
+    }
+    Some(result)
 }
 
 /// Matches a CRLF file as LF, so the model's LF strings fit, and writes CRLF
@@ -130,6 +223,75 @@ mod tests {
         assert_eq!(updated.unwrap(), "x\r\ny\r\nc\r\n");
         let mixed = replace_keeping_line_endings("a\r\nb\nc\n", "b", "y", false);
         assert_eq!(mixed.unwrap(), "a\r\ny\nc\n");
+    }
+
+    #[test]
+    fn miss_hints_are_bounded_and_only_show_relevant_lines() {
+        assert!(
+            miss_hint(
+                "the replacement is already here",
+                "missing",
+                "the replacement is already here"
+            )
+            .unwrap()
+            .contains("already in the file")
+        );
+        let hint = miss_hint(
+            "secret before\nalpha one\nchanged\nomega two\nsecret after",
+            "alpha one\nold value\nomega two",
+            "new",
+        )
+        .unwrap();
+        assert!(hint.contains("2: alpha one") && hint.contains("4: omega two"));
+        assert!(!hint.contains("secret"));
+        assert!(miss_hint("unrelated", "nothing matching", "new").is_none());
+    }
+
+    #[tokio::test]
+    async fn edit_miss_hints_only_when_the_run_may_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("e"), "alpha one\nchanged\nomega two").unwrap();
+        let args = json!({"filePath":"e", "oldString":"alpha one\nold value\nomega two", "newString":"new"});
+        let err = edit(dir.path(), args.clone()).await.unwrap_err();
+        assert!(err.to_string().contains("closest lines"), "{err}");
+
+        let mut ctx = ToolCtx::new(dir.path());
+        ctx.access = Some(Arc::new(crate::tool::RunAccess {
+            tools: Arc::new(crate::tool::Toolset::new()),
+            rules: None,
+            edited: std::sync::Mutex::new(Default::default()),
+            parent: None,
+        }));
+        let err = Typed(EditTool).call(args.clone(), &ctx).await.unwrap_err();
+        assert!(!err.to_string().contains("closest lines"), "{err}");
+
+        struct ReadPolicy(fn() -> ToolError);
+        #[async_trait::async_trait]
+        impl crate::tool::policy::ToolPolicy for ReadPolicy {
+            async fn authorize(
+                &self,
+                name: &str,
+                _: &serde_json::Value,
+                _: &ToolCtx,
+            ) -> Result<(), ToolError> {
+                if name == "read" {
+                    Err((self.0)())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let mut ctx = ToolCtx::new(dir.path());
+        ctx.policy = Arc::new(ReadPolicy(|| ToolError::failure("denied")));
+        let err = Typed(EditTool).call(args.clone(), &ctx).await.unwrap_err();
+        assert!(
+            !err.is_fatal() && !err.to_string().contains("closest lines"),
+            "{err}"
+        );
+
+        ctx.policy = Arc::new(ReadPolicy(|| ToolError::Fatal(crate::Error::Cancelled)));
+        let err = Typed(EditTool).call(args, &ctx).await.unwrap_err();
+        assert!(err.is_fatal(), "{err}");
     }
 
     #[tokio::test]

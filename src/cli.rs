@@ -194,7 +194,15 @@ pub async fn main() -> Result<()> {
                         && matches!(name.as_str(), "read" | "write" | "edit" | "grep" | "glob")
                 })
                 .ok_or_else(|| Error::Config("unknown file tool".into()))?;
-            let ctx = crate::tool::ToolCtx::new(std::env::current_dir()?);
+            let mut ctx = crate::tool::ToolCtx::new(std::env::current_dir()?);
+            if std::env::var_os(crate::tool::policy::WORKER_NO_READ_ENV).is_some() {
+                ctx.access = Some(Arc::new(crate::tool::RunAccess {
+                    tools: Arc::new(crate::tool::Toolset::new()),
+                    rules: None,
+                    edited: Default::default(),
+                    parent: None,
+                }));
+            }
             let result = tool.call(args, &ctx).await.map_err(|err| err.to_string());
             emit(&serde_json::to_string(&result).expect("tool result serialization"));
             Ok(())

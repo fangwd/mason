@@ -93,6 +93,7 @@ pub fn retry_delay(attempt: usize, err: &LlmError) -> Duration {
 
 /// Context-overflow patterns derived from opencode's `ai/src/provider-error.ts`.
 /// Payload-size errors stay here because the engine has no other recovery for them.
+/// LiteLLM wording updated from opencode @84f66054.
 const OVERFLOW_PATTERNS: &[&str] = &[
     "(?i)prompt is too long",
     "(?i)input is too long for (?:the )?(?:requested|selected) model",
@@ -120,6 +121,7 @@ const OVERFLOW_PATTERNS: &[&str] = &[
     // Hugging Face Text Generation Inference, e.g. Together
     "(?i)`inputs` tokens \\+ `max_new_tokens` must be <= \\d+",
     "(?i)context window exceeds limit",
+    "(?i)context window exceeded",
     "(?i)exceeded model token limit",
     "(?i)context[_ ]length[_ ]exceeded",
     "(?i)context length is only \\d+ tokens",
@@ -303,6 +305,7 @@ mod tests {
             "requested input length 140000 exceeds maximum input length 131072",
             "`inputs` tokens + `max_new_tokens` must be <= 32768",
             "Payload Too Large",
+            "litellm.ContextWindowExceededError: context window exceeded",
         ];
         for message in positives {
             assert!(

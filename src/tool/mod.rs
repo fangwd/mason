@@ -160,6 +160,25 @@ impl ToolCtx {
             .find_map(|access| access.rules.as_ref()?.check(name, args, &self.cwd))
     }
 
+    /// Whether this run may `read` the file in `args`: the tool must be available
+    /// to this run and its ancestors, permitted by their rules, and authorized by
+    /// the policy. A fatal policy error propagates.
+    pub(crate) async fn may_read(&self, args: &Value) -> Result<bool, ToolError> {
+        let available = self.access.as_ref().is_none_or(|access| {
+            access
+                .ancestors()
+                .all(|access| access.tools.get("read").is_some())
+        });
+        if !available || self.check_rules("read", args).is_some() {
+            return Ok(false);
+        }
+        match self.policy.authorize("read", args, self).await {
+            Ok(()) => Ok(true),
+            Err(err) if err.is_fatal() => Err(err),
+            Err(_) => Ok(false),
+        }
+    }
+
     /// Sets the cancellation token (a child of the run's token).
     pub fn with_token(mut self, token: CancellationToken) -> Self {
         self.token = token;

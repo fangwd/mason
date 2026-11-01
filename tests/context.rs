@@ -391,7 +391,9 @@ async fn usage_is_recorded_and_estimates_still_drive_compaction() {
     run_config.model = model.clone();
     run_config.messages = messages;
     run_config.max_tokens = Some(500);
-    run_config.compact = Some(in_memory_compactor(model.clone(), prompts, 500));
+    // Summary requests have their own prompt and need a larger budget than
+    // this deliberately tiny main-request limit.
+    run_config.compact = Some(in_memory_compactor(model.clone(), prompts, 2_000));
 
     let outcome = engine::run(run_config).await.unwrap();
     assert_eq!(outcome.answer, "done");
@@ -431,6 +433,83 @@ async fn an_empty_summary_fails() {
     .await
     .unwrap_err();
     assert!(err.to_string().contains("summary came back empty"), "{err}");
+}
+
+#[tokio::test]
+async fn oversized_prior_summary_is_folded_into_the_conversation() {
+    let prompts = PromptSource::Embedded.load().unwrap();
+    let model = ScriptedModel::new(vec![answer("summary 1"), answer("summary 2")]);
+    let usable = 2_000;
+    let summary = summarize(
+        &*model,
+        &prompts,
+        &[Message::user("hello")],
+        Some(&"x".repeat(20_000)),
+        usable,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary, "summary 2");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2);
+    let first = requests[0].messages[1].content.as_deref().unwrap();
+    assert!(first.contains("[Prior summary]: xxx"), "{first}");
+    assert!(!first.contains("<prior-summary>"), "{first}");
+    for request in &requests {
+        assert!(mason::context::estimate_tokens(&request.messages) <= usable);
+    }
+}
+
+#[tokio::test]
+async fn a_folded_summary_that_stays_oversized_is_clipped_so_history_is_reached() {
+    let prompts = PromptSource::Embedded.load().unwrap();
+    let big = "y".repeat(20_000);
+    let model = ScriptedModel::new(vec![answer(&big), answer(&big), answer(&big)]);
+    let usable = 2_000;
+    summarize(
+        &*model,
+        &prompts,
+        &[Message::user("hello")],
+        Some(&"x".repeat(20_000)),
+        usable,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let requests = model.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "one fold, then a clip; no further retries"
+    );
+    let second = requests[1].messages[1].content.as_deref().unwrap();
+    assert!(second.contains("[User]: hello"), "{second}");
+    assert!(
+        second.contains("<prior-summary>") && second.contains("[... truncated ...]"),
+        "{second}"
+    );
+    for request in &requests {
+        assert!(mason::context::estimate_tokens(&request.messages) <= usable);
+    }
+}
+
+#[tokio::test]
+async fn a_budget_below_the_compaction_prompt_fails_before_requesting() {
+    let prompts = PromptSource::Embedded.load().unwrap();
+    let model = ScriptedModel::new(vec![answer("unused")]);
+    let err = summarize(
+        &*model,
+        &prompts,
+        &[Message::user("hello")],
+        None,
+        100,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("leaves no room"), "{err}");
+    assert_eq!(model.request_count(), 0);
 }
 
 #[tokio::test]

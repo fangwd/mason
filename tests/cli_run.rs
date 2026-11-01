@@ -748,3 +748,35 @@ async fn run_reports_the_evaluator_verdict() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("Hello world"));
 }
+
+#[tokio::test]
+async fn tool_worker_omits_edit_hints_when_the_parent_denies_read() {
+    use tokio::io::AsyncWriteExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("e"), "alpha one\nchanged\nomega two").unwrap();
+    let args = serde_json::json!({
+        "filePath": "e", "oldString": "alpha one\nold value\nomega two", "newString": "new"
+    });
+    let mut errors = Vec::new();
+    for no_read in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mason"));
+        command
+            .args(["tool-worker", "edit"])
+            .current_dir(dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        if no_read {
+            command.env("MASON_WORKER_NO_READ", "1");
+        }
+        let mut child = command.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(args.to_string().as_bytes()).await.unwrap();
+        drop(stdin);
+        let output = child.wait_with_output().await.unwrap();
+        assert!(output.status.success());
+        let result: Result<String, String> = serde_json::from_slice(&output.stdout).unwrap();
+        errors.push(result.unwrap_err());
+    }
+    assert!(errors[0].contains("closest lines"), "{}", errors[0]);
+    assert!(!errors[1].contains("closest lines"), "{}", errors[1]);
+}

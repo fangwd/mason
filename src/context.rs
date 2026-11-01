@@ -1,6 +1,7 @@
 //! Context pruning and summary-based compaction. Request estimates, not prior provider
 //! usage, drive context limits.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
@@ -237,37 +238,79 @@ pub async fn summarize(
 ) -> Result<String> {
     let system = Message::system(prompts.compaction.system.clone());
     let mut summary = previous_summary.map(str::to_owned);
-    let mut context = messages.iter().map(serialize).peekable();
-    while context.peek().is_some() {
-        // The fixed prompt cannot shrink, so tiny contexts still give the
-        // conversation half the budget.
-        let room = usable
-            .saturating_sub(
-                estimate_tokens(std::slice::from_ref(&system))
-                    + estimate_str(&compaction_prompt(prompts, summary.as_deref(), &[])),
-            )
-            .max(usable / 2);
+    let mut context: VecDeque<String> = messages.iter().map(serialize).collect();
+    let no_room = || {
+        Error::Run(
+            "the compaction prompt leaves no room for conversation within the context budget"
+                .into(),
+        )
+    };
+    // Whether the current summary came from re-summarizing a folded one alone.
+    let mut folded = false;
+    while !context.is_empty() {
+        let mut room = conversation_room(&system, prompts, summary.as_deref(), usable);
+        if room.is_none()
+            && let Some(previous) = summary.take()
+        {
+            if folded {
+                // Re-summarizing did not shrink it: clip to half the room so the
+                // waiting history is reached instead of folding again.
+                let base = conversation_room(&system, prompts, None, usable).ok_or_else(no_room)?;
+                summary = Some(clip(&previous, base * 2));
+            } else {
+                // A prior summary that crowds out the conversation is folded into
+                // it and summarized again like any other history.
+                context.push_front(format!("[Prior summary]: {previous}"));
+            }
+            folded = !folded;
+            room = conversation_room(&system, prompts, summary.as_deref(), usable);
+        }
+        let room = room.ok_or_else(no_room)?;
         let mut chunk: Vec<String> = Vec::new();
         let mut used = 0;
-        while let Some(part) = context.peek() {
-            // One more token for the separator between parts.
-            let tokens = estimate_str(part) + 1;
+        while let Some(part) = context.front() {
+            // Allow for separators and estimator rounding at each boundary.
+            let tokens = estimate_str(part) + 2;
             if used + tokens <= room {
                 used += tokens;
-                chunk.extend(context.next());
+                chunk.extend(context.pop_front());
             } else if chunk.is_empty() {
-                let max = room.saturating_mul(4).saturating_sub(64);
-                chunk.extend(context.next().map(|part| clip(&part, max)));
+                let max = room.saturating_mul(4).saturating_sub(80);
+                chunk.extend(context.pop_front().map(|part| clip(&part, max)));
                 break;
             } else {
                 break;
             }
+        }
+        // A fold made progress only if history followed the summary in the chunk.
+        folded = folded && chunk.len() == 1;
+        let request_tokens = estimate_tokens(&[
+            system.clone(),
+            Message::user(compaction_prompt(prompts, summary.as_deref(), &chunk)),
+        ]);
+        if request_tokens > usable {
+            return Err(Error::Run(
+                "compaction request exceeds the context budget".into(),
+            ));
         }
         summary = Some(
             summarize_chunk(model, &system, prompts, &chunk, summary.as_deref(), token).await?,
         );
     }
     summary.ok_or_else(|| Error::Run("there was nothing to summarize".to_owned()))
+}
+
+/// Tokens left for conversation after the system prompt, the compaction prompt,
+/// and any prior summary; `None` when too few remain to be worth a request.
+fn conversation_room(
+    system: &Message,
+    prompts: &PromptSet,
+    summary: Option<&str>,
+    usable: usize,
+) -> Option<usize> {
+    let fixed = estimate_tokens(std::slice::from_ref(system))
+        + estimate_str(&compaction_prompt(prompts, summary, &[]));
+    usable.checked_sub(fixed).filter(|room| *room > 16)
 }
 
 async fn summarize_chunk(

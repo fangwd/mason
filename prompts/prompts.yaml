@@ -2,6 +2,8 @@
 # Sections marked (opencode) derive from sst/opencode @1ddb087, or the commit
 # they name (MIT); the full notice is in the repository LICENSE under
 # "Third-party notices".
+# Other ports: context-overflow detection and edit-miss hints were reviewed
+# against anomalyco/opencode @84f66054; see their source files for details.
 # Only validated {{name}} placeholders interpolate; single braces are literal.
 
 system:
