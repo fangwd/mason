@@ -488,8 +488,30 @@ impl SessionStore for SqliteStore {
         if query.agent.is_some() {
             sql.push_str(" AND s.agent = ?");
         }
-        if query.before.is_some() {
-            sql.push_str(&format!(" AND {activity} < ?"));
+        match (query.before, query.before_id) {
+            (Some(_), Some(_)) => sql.push_str(&format!(
+                " AND ({activity} < ? OR ({activity} = ? AND s.id < ?))"
+            )),
+            (Some(_), None) => sql.push_str(&format!(" AND {activity} < ?")),
+            (None, _) => {}
+        }
+        let search = query
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| {
+                let escaped = text
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
+                format!("%{escaped}%")
+            });
+        if search.is_some() {
+            sql.push_str(
+                " AND (s.title LIKE ? ESCAPE '\\'
+                       OR EXISTS (SELECT 1 FROM input i WHERE i.session_id = s.id AND i.content LIKE ? ESCAPE '\\'))",
+            );
         }
         sql.push_str(&format!(" ORDER BY {activity} DESC, s.id DESC LIMIT ?"));
 
@@ -502,6 +524,12 @@ impl SessionStore for SqliteStore {
         }
         if let Some(before) = query.before {
             statement = statement.bind(before.timestamp_millis());
+            if let Some(id) = query.before_id {
+                statement = statement.bind(before.timestamp_millis()).bind(id as i64);
+            }
+        }
+        if let Some(pattern) = search {
+            statement = statement.bind(pattern.clone()).bind(pattern);
         }
         let limit = query.limit.unwrap_or(50).clamp(1, 200) as i64;
         statement = statement.bind(limit);

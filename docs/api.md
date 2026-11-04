@@ -17,7 +17,7 @@ Embedders get the same layer with `router_with_security`; bare
 | --- | --- |
 | `GET /healthz` | Version and liveness; no token. |
 | `POST /sessions` | Create a session: `title`, `agent` (profile; must exist and not be a subagent profile), opaque JSON `metadata` (stored unread). Returns `{id}`. |
-| `GET /sessions` | List sessions; filters `agent`, `parentId`, `limit`, `before` (ISO date). Each entry adds `busy` and `stalled`. |
+| `GET /sessions` | List sessions; filters `agent`, `parentId`, `limit`, `before` (ISO date) with an optional `beforeId` tiebreak (pass the last row's activity and id to page on), `q` (text in the title or any input, ignoring ASCII case). Each entry adds `busy` and `stalled`. |
 | `GET /sessions/:id` | One session, including `metadata`, `busy`, `stalled`. |
 | `PATCH /sessions/:id` | Sets `title` and/or `metadata` (`null` clears it). |
 | `DELETE /sessions/:id` | Removes an idle session with its history and children; 409 while it runs. |

@@ -255,6 +255,8 @@ struct ListQuery {
     parent_id: Option<SessionId>,
     limit: Option<u32>,
     before: Option<String>,
+    before_id: Option<SessionId>,
+    q: Option<String>,
 }
 
 async fn list_sessions(
@@ -266,6 +268,7 @@ async fn list_sessions(
             Ok(parsed) => Some(parsed.with_timezone(&Utc)),
             Err(_) => return bad_request("before must be an ISO date"),
         },
+        None if query.before_id.is_some() => return bad_request("beforeId needs before"),
         None => None,
     };
     let list_query = SessionQuery {
@@ -273,6 +276,8 @@ async fn list_sessions(
         parent_id: query.parent_id,
         limit: query.limit,
         before,
+        before_id: query.before_id,
+        search: query.q,
     };
     match state.store.list_sessions(&list_query).await {
         Ok(summaries) => {

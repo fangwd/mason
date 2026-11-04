@@ -392,6 +392,31 @@ async fn list_sessions_filters_and_reflects_busy() {
         .collect();
     assert_eq!(ids, [b]);
 
+    let searched: Value = fx
+        .client
+        .get(format!("{}/sessions?q=FIRST", fx.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<u64> = searched["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(ids, [a]);
+
+    let unpaired = fx
+        .client
+        .get(format!("{}/sessions?beforeId=1", fx.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unpaired.status(), 400);
+
     let none: Value = fx
         .client
         .get(format!("{}/sessions?before=1970-01-01T00:00:00Z", fx.base))

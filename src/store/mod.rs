@@ -159,6 +159,11 @@ pub struct SessionQuery {
     pub limit: Option<u32>,
     /// Only sessions whose latest activity is before this time.
     pub before: Option<DateTime<Utc>>,
+    /// With `before`, also sessions active exactly then with a lower id: the
+    /// last listed row's (activity, id) pages on without gaps.
+    pub before_id: Option<SessionId>,
+    /// Only sessions whose title or any input contains this text, ignoring ASCII case.
+    pub search: Option<String>,
 }
 
 /// A session list row. `busy` is supplied by the runner, not the store.

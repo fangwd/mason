@@ -285,6 +285,89 @@ async fn list_sessions_orders_by_latest_activity() {
 }
 
 #[tokio::test]
+async fn list_sessions_pages_through_sessions_active_at_the_same_time() {
+    let (dir, store) = store().await;
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        ids.push(store.create_session(NewSession::default()).await.unwrap());
+    }
+    let db = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        dir.path().join("mason.db").display()
+    ))
+    .await
+    .unwrap();
+    sqlx::query("UPDATE session SET created_at = 1000")
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = store
+            .list_sessions(&SessionQuery {
+                limit: Some(1),
+                before: cursor.map(|(at, _)| at),
+                before_id: cursor.map(|(_, id)| id),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let Some(last) = page.last() else { break };
+        cursor = Some((last.created_at, last.id));
+        seen.extend(page.iter().map(|session| session.id));
+    }
+    ids.reverse();
+    assert_eq!(seen, ids, "every session once, latest id first");
+}
+
+#[tokio::test]
+async fn list_sessions_searches_titles_and_inputs() {
+    let (_dir, store) = store().await;
+    let titled = store
+        .create_session(NewSession {
+            title: Some("Fix the Price selector".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let asked = store.create_session(NewSession::default()).await.unwrap();
+    store
+        .add_input(asked, NewInput::queued("why is the price 100% off?"))
+        .await
+        .unwrap();
+    store.create_session(NewSession::default()).await.unwrap();
+
+    let search = |text: &str| {
+        let query = SessionQuery {
+            search: Some(text.into()),
+            ..Default::default()
+        };
+        let store = &store;
+        async move {
+            let mut ids: Vec<u64> = store
+                .list_sessions(&query)
+                .await
+                .unwrap()
+                .iter()
+                .map(|session| session.id)
+                .collect();
+            ids.sort();
+            ids
+        }
+    };
+    assert_eq!(
+        search("price").await,
+        [titled, asked],
+        "title or input, any case"
+    );
+    assert_eq!(search("100%").await, [asked]);
+    assert!(search("1_0").await.is_empty(), "wildcards match literally");
+    assert_eq!(search("  ").await.len(), 3, "blank text does not filter");
+}
+
+#[tokio::test]
 async fn concurrent_start_runs_claim_inputs_exactly_once() {
     let (_dir, store) = store().await;
     let store = Arc::new(store);
