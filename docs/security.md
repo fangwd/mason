@@ -78,6 +78,9 @@ location, quota and retention through `OutputSpill`.
 - **Evaluation sends transcripts to the evaluator's provider.** With
   `AI_EVALUATOR_VENDORS` on another provider than the main model, every
   graded run's clipped transcript goes there too.
+- **`look` sends images to the vision provider.** With `AI_VISION_VENDORS`
+  on another provider than the main model, every image the main model asks
+  about, with its question, goes there too.
 - **Prompt injection is a model-level defence only.** System prompts instruct
   the model to treat file contents, command output and web pages as untrusted
   evidence; that is mitigation, not isolation.

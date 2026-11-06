@@ -164,7 +164,7 @@ fn wire_messages(messages: &[Message], images: bool) -> Vec<RequestMessage<'_>> 
     let mut parts = Vec::new();
     for message in messages {
         // Strict chat templates reject two user turns in a row.
-        if message.role == Role::User && !parts.is_empty() {
+        if message.role == Role::User && !(parts.is_empty() && message.images.is_empty()) {
             let mut content = std::mem::take(&mut parts);
             content.extend(
                 message
@@ -172,6 +172,17 @@ fn wire_messages(messages: &[Message], images: bool) -> Vec<RequestMessage<'_>> 
                     .clone()
                     .map(|text| RequestPart::Text { text }),
             );
+            if images {
+                content.extend(message.images.iter().map(|image| RequestPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: image.data_url(),
+                    },
+                }));
+            } else if !message.images.is_empty() {
+                content.push(RequestPart::Text {
+                    text: IMAGES_NOT_SENT.to_owned(),
+                });
+            }
             wire.push(RequestMessage::Parts {
                 role: Role::User,
                 content,
@@ -474,14 +485,33 @@ struct WireUsage {
     prompt_tokens: Option<u32>,
     #[serde(default)]
     completion_tokens: Option<u32>,
+    /// OpenAI's cached prompt tokens.
+    #[serde(default)]
+    prompt_tokens_details: Option<WirePromptDetails>,
+    /// DeepSeek's cached prompt tokens.
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct WirePromptDetails {
+    #[serde(default)]
+    cached_tokens: Option<u32>,
 }
 
 impl WireUsage {
     fn delta(self) -> ChatDelta {
-        ChatDelta::Usage {
+        ChatDelta::Usage(crate::llm::Usage {
             prompt_tokens: self.prompt_tokens.unwrap_or(0),
             completion_tokens: self.completion_tokens.unwrap_or(0),
-        }
+            cached_tokens: self
+                .prompt_cache_hit_tokens
+                .or(self
+                    .prompt_tokens_details
+                    .and_then(|details| details.cached_tokens))
+                .filter(|&cached| cached > 0),
+            ..Default::default()
+        })
     }
 }
 
@@ -560,6 +590,7 @@ mod tests {
             headers: Default::default(),
             stream,
             images: true,
+            price: None,
         }
     }
 
@@ -631,6 +662,35 @@ mod tests {
                     {"type": "text", "text": "Images returned by tool call c1:"},
                     {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1n"}},
                     {"type": "text", "text": "next"}
+                ]}
+            ])
+        );
+    }
+
+    #[test]
+    fn a_user_messages_images_follow_its_text_in_the_same_turn() {
+        let request = ChatRequest {
+            messages: vec![
+                Message::system("s"),
+                Message {
+                    images: vec![crate::llm::Image {
+                        mime_type: "image/png".into(),
+                        data: "aW1n".into(),
+                    }],
+                    ..Message::user("which swatch is selected?")
+                },
+            ],
+            tools: vec![],
+        };
+        let body: serde_json::Value =
+            serde_json::from_slice(&request_body(&vendor(true), &request).unwrap()).unwrap();
+        assert_eq!(
+            body["messages"],
+            json!([
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "which swatch is selected?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1n"}}
                 ]}
             ])
         );
@@ -745,10 +805,11 @@ mod tests {
         let (deltas, _) = deltas_of(decode_chunk(&usage).unwrap());
         assert_eq!(
             deltas,
-            vec![ChatDelta::Usage {
+            vec![ChatDelta::Usage(crate::llm::Usage {
                 prompt_tokens: 11,
-                completion_tokens: 7
-            }]
+                completion_tokens: 7,
+                ..Default::default()
+            })]
         );
     }
 
@@ -778,10 +839,11 @@ mod tests {
         assert_eq!(indices, [0, 1]);
         assert_eq!(
             deltas.last(),
-            Some(&ChatDelta::Usage {
+            Some(&ChatDelta::Usage(crate::llm::Usage {
                 prompt_tokens: 5,
-                completion_tokens: 0
-            })
+                completion_tokens: 0,
+                ..Default::default()
+            }))
         );
 
         // A single-shot tool call without `type`.
@@ -878,10 +940,11 @@ mod tests {
                     name: Some("read".into()),
                     arguments: "{\"a\":1}".into()
                 },
-                ChatDelta::Usage {
+                ChatDelta::Usage(crate::llm::Usage {
                     prompt_tokens: 11,
-                    completion_tokens: 7
-                },
+                    completion_tokens: 7,
+                    ..Default::default()
+                }),
                 ChatDelta::Done {
                     finish_reason: Some("tool_calls".into())
                 },

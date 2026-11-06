@@ -20,7 +20,8 @@ Vendor names use letters, digits and `_`. Optional per-vendor settings:
 | `AI_<NAME>_API_KEY` | May be omitted for servers without authentication (vLLM, Ollama); no `Authorization` header is sent then. |
 | `AI_<NAME>_CONTEXT_TOKENS` | Context capacity (default 128000). |
 | `AI_<NAME>_STREAM` | Streaming on/off (default true). |
-| `AI_<NAME>_IMAGES` | Send tool images such as screenshots (default true); set `false` for models without image input. |
+| `AI_<NAME>_IMAGES` | Send tool images such as screenshots (default true); set `false` for models without image input, which then ask a vision model about them when `AI_VISION_VENDORS` is set. |
+| `AI_<NAME>_PRICE` | USD per million tokens, `input,output` or `input,output,cached` (cached prompt tokens cost `input` when unset), e.g. `0.30,1.20,0.006`; every recorded turn then carries its cost. |
 | `AI_<NAME>_EXTRA_BODY` | JSON object merged into every request, e.g. `{"max_tokens": 32000, "temperature": 0.2}` or `{"enable_thinking": true}`. |
 | `AI_<NAME>_HEADERS` | JSON object of extra headers, e.g. Azure's `{"api-key": "..."}` or OpenRouter's `{"HTTP-Referer": "..."}`. |
 
@@ -50,6 +51,24 @@ Ollama's default context is smaller than that prompt, and an overlong prompt
 is cut silently; raise it on the server (`OLLAMA_CONTEXT_LENGTH=16384 ollama
 serve`, or `num_ctx` in a Modelfile), since the OpenAI-compatible API cannot
 set it. If streamed tool calls misbehave, set `AI_OLLAMA_STREAM=false`.
+
+Optionally, `AI_VISION_VENDORS` names vendors, configured the same way, for a
+model that sees the images tools return (screenshots) when the main model
+cannot: with every main vendor set to `AI_<NAME>_IMAGES=false`, runs get a
+`look` tool. A tool result then says its images were not sent and gives its
+call id, and the main model calls `look` with that id and a question; the
+vision model answers from the images alone, one request per look, and its
+usage is recorded on the `look` result. Profiles that list their tools need
+`look` among them.
+
+```sh
+export AI_VENDORS=reasoner
+export AI_REASONER_IMAGES=false
+export AI_VISION_VENDORS=eyes
+export AI_EYES_URL=https://api.example.com/v1
+export AI_EYES_MODEL=your-cheap-vision-model-id
+export AI_EYES_API_KEY=your-api-key
+```
 
 ## Run
 

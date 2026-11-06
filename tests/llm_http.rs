@@ -65,7 +65,9 @@ async fn streams_over_real_http() {
         turn.usage,
         Some(Usage {
             prompt_tokens: 3,
-            completion_tokens: 2
+            completion_tokens: 2,
+            model: Some("mock-model".into()),
+            ..Default::default()
         })
     );
 }
@@ -96,7 +98,9 @@ async fn single_shot_vendors_post_without_stream_flags() {
         turn.usage,
         Some(Usage {
             prompt_tokens: 3,
-            completion_tokens: 1
+            completion_tokens: 1,
+            model: Some("mock-model".into()),
+            ..Default::default()
         })
     );
 

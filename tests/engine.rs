@@ -1711,6 +1711,7 @@ impl mason::Tool for ShotTool {
                 mime_type: "image/png".into(),
                 data: PNG.into(),
             }],
+            usage: None,
         })
     }
 }
@@ -1762,10 +1763,11 @@ async fn committed_messages_carry_estimated_tokens_and_provider_usage() {
             call_id("c1", "shot", "{}"),
             Reply::Deltas(vec![
                 ChatDelta::Text("seen".into()),
-                ChatDelta::Usage {
+                ChatDelta::Usage(mason::llm::Usage {
                     prompt_tokens: 1234,
                     completion_tokens: 5,
-                },
+                    ..Default::default()
+                }),
             ]),
         ],
         vec![Box::new(ShotTool)],
@@ -1807,12 +1809,16 @@ async fn committed_messages_carry_estimated_tokens_and_provider_usage() {
         result_tokens.estimated > mason::context::IMAGE_TOKENS,
         "the image counts"
     );
-    assert_eq!((call_tokens.usage, result_tokens.usage), (None, None));
+    assert_eq!(
+        (call_tokens.usage.clone(), result_tokens.usage.clone()),
+        (None, None)
+    );
     assert_eq!(
         answer_tokens.usage,
         Some(mason::llm::Usage {
             prompt_tokens: 1234,
-            completion_tokens: 5
+            completion_tokens: 5,
+            ..Default::default()
         }),
         "a reply carries the usage of the request that produced it"
     );
@@ -1823,7 +1829,7 @@ async fn committed_messages_carry_estimated_tokens_and_provider_usage() {
             streamed.push(tokens);
         }
     }
-    let persisted: Vec<_> = saved.iter().map(|(_, tokens)| *tokens).collect();
+    let persisted: Vec<_> = saved.iter().map(|(_, tokens)| tokens.clone()).collect();
     assert_eq!(streamed, persisted, "the stream carries the same counts");
 }
 
@@ -1851,6 +1857,7 @@ impl mason::Tool for SvgTool {
                     data: PNG.into(),
                 },
             ],
+            usage: None,
         })
     }
 }
@@ -1892,7 +1899,7 @@ async fn unusable_tool_images_are_dropped_with_a_note_and_labels_are_corrected()
 async fn a_new_screenshot_survives_while_older_text_is_shortened() {
     let run = |max_tokens: Option<usize>| async move {
         let dir = tempfile::tempdir().unwrap();
-        let (big, _) = EchoTool::boxed("big", &"x".repeat(1600));
+        let (big, _) = EchoTool::boxed("big", &"x".repeat(720));
         let (mut config, model) = config(
             vec![
                 call_id("c1", "big", "{}"),
@@ -1911,7 +1918,7 @@ async fn a_new_screenshot_survives_while_older_text_is_shortened() {
     let size = mason::context::estimate_tokens(&full.messages)
         + mason::context::estimate_str(&serde_json::to_string(&full.tools).unwrap());
     // Slightly over budget: too little to prune, so the tool text is shortened.
-    let sent = run(Some(size - 60)).await.messages;
+    let sent = run(Some(size - 30)).await.messages;
     let result = |id: &str| {
         sent.iter()
             .find(|message| message.tool_call_id.as_deref() == Some(id))
@@ -1930,4 +1937,151 @@ async fn a_new_screenshot_survives_while_older_text_is_shortened() {
             .contains("[Shortened for context;"),
         "the older text gives way first"
     );
+}
+
+/// A main model without image input.
+struct TextOnly(Arc<ScriptedModel>);
+
+#[async_trait::async_trait]
+impl mason::llm::ChatModel for TextOnly {
+    fn context_tokens(&self) -> usize {
+        mason::llm::ChatModel::context_tokens(&*self.0)
+    }
+
+    fn accepts_images(&self) -> bool {
+        false
+    }
+
+    async fn stream(
+        &self,
+        request: mason::llm::ChatRequest,
+        token: &CancellationToken,
+    ) -> mason::Result<mason::llm::ChatStream> {
+        mason::llm::ChatModel::stream(&*self.0, request, token).await
+    }
+}
+
+fn shot_agent(
+    dir: &std::path::Path,
+    model: Arc<dyn mason::llm::ChatModel>,
+    vision: Arc<ScriptedModel>,
+) -> mason::Agent {
+    mason::Agent::builder()
+        .model(model)
+        .vision(vision)
+        .cwd(dir)
+        .tools(vec![Box::new(ShotTool) as Box<dyn mason::Tool>])
+        .spill(Arc::new(mason::OutputSpill::new(dir.join("spill"))))
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_text_only_model_asks_the_vision_model_about_a_screenshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = ScriptedModel::new(vec![
+        call_id("c1", "shot", "{}"),
+        call_id(
+            "c2",
+            "look",
+            r#"{"call_id":"c1","question":"Which swatch is selected?"}"#,
+        ),
+        answer("done"),
+    ]);
+    let vision = ScriptedModel::new(vec![answer("The first swatch.")]);
+    let agent = shot_agent(dir.path(), Arc::new(TextOnly(main.clone())), vision.clone());
+    assert_eq!(agent.run_prompt("go", None).await.unwrap().answer, "done");
+
+    let requests = main.requests();
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .any(|spec| spec.function.name == "look"),
+        "a text-only model with a vision model gets look"
+    );
+    let shot = requests[1]
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some("c1"))
+        .unwrap();
+    assert!(shot.images.is_empty());
+    assert!(
+        shot.content
+            .as_deref()
+            .unwrap()
+            .ends_with(r#"ask about them with look, call_id "c1"]"#),
+        "{shot:?}"
+    );
+
+    let asked = vision.requests();
+    assert_eq!(asked.len(), 1);
+    assert!(asked[0].tools.is_empty());
+    let question = asked[0].messages.last().unwrap();
+    assert_eq!(question.role, Role::User);
+    assert_eq!(
+        question.content.as_deref(),
+        Some("Which swatch is selected?")
+    );
+    assert_eq!(
+        question.images.len(),
+        1,
+        "the screenshot goes to the vision model"
+    );
+
+    let answered = requests[2]
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some("c2"))
+        .unwrap();
+    assert_eq!(answered.content.as_deref(), Some("The first swatch."));
+}
+
+#[tokio::test]
+async fn a_model_that_takes_images_sees_them_without_look() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = ScriptedModel::new(vec![call_id("c1", "shot", "{}"), answer("done")]);
+    let vision = ScriptedModel::new(vec![]);
+    let agent = shot_agent(dir.path(), main.clone(), vision.clone());
+    agent.run_prompt("go", None).await.unwrap();
+    let requests = main.requests();
+    assert!(
+        !requests[0]
+            .tools
+            .iter()
+            .any(|spec| spec.function.name == "look")
+    );
+    let shot = requests[1]
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some("c1"))
+        .unwrap();
+    assert_eq!(shot.images.len(), 1);
+    assert_eq!(vision.request_count(), 0);
+}
+
+#[tokio::test]
+async fn what_look_spends_counts_against_the_run_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = ScriptedModel::new(vec![
+        call_id("c1", "shot", "{}"),
+        call_id("c2", "look", r#"{"call_id":"c1","question":"Which?"}"#),
+        answer("done"),
+    ]);
+    // Over the default 20M-token run budget on its own.
+    let vision = ScriptedModel::new(vec![Reply::Deltas(vec![
+        ChatDelta::Text("The first.".into()),
+        ChatDelta::Usage(mason::llm::Usage {
+            prompt_tokens: 30_000_000,
+            completion_tokens: 10,
+            ..Default::default()
+        }),
+    ])]);
+    let agent = shot_agent(dir.path(), Arc::new(TextOnly(main.clone())), vision);
+    let err = agent.run_prompt("go", None).await.unwrap_err();
+    assert!(
+        matches!(err, mason::Error::BudgetExceeded("token")),
+        "{err:?}"
+    );
+    assert_eq!(main.request_count(), 2, "the run stops at the look");
 }

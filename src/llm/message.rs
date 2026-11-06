@@ -174,10 +174,19 @@ pub struct ChatRequest {
 }
 
 /// The provider's token accounting for one turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// The prompt tokens the provider served from its cache, when it said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
+    /// The model the vendor was asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// What the turn cost in USD, at the vendor's configured price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
 }
 
 /// One incremental piece of a model turn, in arrival order.
@@ -201,10 +210,7 @@ pub enum ChatDelta {
         arguments: String,
     },
     /// The provider's token usage, typically just before completion.
-    Usage {
-        prompt_tokens: u32,
-        completion_tokens: u32,
-    },
+    Usage(Usage),
     /// The turn completed; the stream ends here.
     Done {
         /// Why the model stopped, when the provider said.
@@ -337,14 +343,8 @@ impl TurnAccumulator {
                 }
                 call.arguments.push_str(&arguments);
             }
-            ChatDelta::Usage {
-                prompt_tokens,
-                completion_tokens,
-            } => {
-                self.usage = Some(Usage {
-                    prompt_tokens,
-                    completion_tokens,
-                });
+            ChatDelta::Usage(usage) => {
+                self.usage = Some(usage);
             }
             ChatDelta::Done { finish_reason } => {
                 self.completed = true;
@@ -503,10 +503,11 @@ mod tests {
             ChatDelta::Text("Hel".into()),
             ChatDelta::Reasoning("hmm".into()),
             ChatDelta::Text("lo".into()),
-            ChatDelta::Usage {
+            ChatDelta::Usage(Usage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
-            },
+                ..Default::default()
+            }),
             ChatDelta::Done {
                 finish_reason: Some("stop".into()),
             },
@@ -520,7 +521,8 @@ mod tests {
             turn.usage,
             Some(Usage {
                 prompt_tokens: 10,
-                completion_tokens: 5
+                completion_tokens: 5,
+                ..Default::default()
             })
         );
     }

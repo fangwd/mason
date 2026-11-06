@@ -882,7 +882,8 @@ pub fn is_builtin_profile(name: &str) -> bool {
 
 impl AgentSpec {
     /// Builds the agent these settings describe, with vendors and the optional
-    /// evaluator's vendors (`AI_EVALUATOR_VENDORS`) from the environment.
+    /// evaluator's and vision vendors (`AI_EVALUATOR_VENDORS`,
+    /// `AI_VISION_VENDORS`) from the environment.
     pub async fn into_builder(self) -> Result<AgentBuilder> {
         let timeouts = self.model_timeouts;
         let mut builder = self.into_builder_with_vendors(Vendors::from_env()?).await?;
@@ -891,6 +892,10 @@ impl AgentSpec {
             builder = builder.evaluator(Arc::new(crate::evaluate::LlmEvaluator::new(Arc::new(
                 model,
             ))));
+        }
+        if let Some(vendors) = Vendors::vision_from_env()? {
+            let model = crate::llm::VendorModel::new(vendors).with_timeouts(timeouts)?;
+            builder = builder.vision(Arc::new(model));
         }
         Ok(builder)
     }

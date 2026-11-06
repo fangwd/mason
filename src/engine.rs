@@ -90,7 +90,7 @@ impl RunBudget {
             tool_slots: tokio::sync::Semaphore::new(limits.max_concurrent_tools),
         }
     }
-    fn charge_tokens(&self, tokens: usize) -> Result<()> {
+    pub(crate) fn charge_tokens(&self, tokens: usize) -> Result<()> {
         if self
             .tokens
             .fetch_add(tokens, Ordering::SeqCst)
@@ -100,6 +100,22 @@ impl RunBudget {
             return Err(Error::BudgetExceeded("token"));
         }
         Ok(())
+    }
+    /// Charges what a model turn used beyond the `estimated` input charged before it.
+    pub(crate) fn charge_reply(&self, estimated: usize, turn: &ChatTurn) -> Result<()> {
+        let reported_prompt = turn
+            .usage
+            .as_ref()
+            .map_or(0, |usage| usage.prompt_tokens as usize);
+        let completion = turn.usage.as_ref().map_or_else(
+            || estimate_tokens(std::slice::from_ref(&turn.message)),
+            |usage| usage.completion_tokens as usize,
+        );
+        self.charge_tokens(
+            reported_prompt
+                .saturating_sub(estimated)
+                .saturating_add(completion),
+        )
     }
     fn tokens_left(&self) -> usize {
         self.max_tokens
@@ -143,7 +159,7 @@ pub enum RunEvent {
 }
 
 /// The token counts logged with a committed message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MessageTokens {
     /// Mason's estimate of the message's size in context.
     pub estimated: usize,
@@ -303,7 +319,7 @@ fn normalize_cancellation(
 /// Shared state across a run's workers.
 struct RunShared {
     max_response_bytes: usize,
-    conversation: Mutex<Vec<Message>>,
+    conversation: Arc<Mutex<Vec<Message>>>,
     doom: DoomState,
     tools: Arc<Toolset>,
     ctx: ToolCtx,
@@ -328,7 +344,7 @@ impl RunShared {
         let mut conversation = self.conversation.lock().await;
         conversation.push(message.clone());
         if let Some(persist) = &self.persist {
-            let mut future = persist(turn, message.clone(), tokens);
+            let mut future = persist(turn, message.clone(), tokens.clone());
             tokio::select! {
                 result = &mut future => result?,
                 () = self.ctx.token.cancelled() => {
@@ -450,8 +466,11 @@ async fn run_loop(
         Some(run_id) => Arc::from(run_id.as_str()),
         None => Arc::from(uuid::Uuid::new_v4().to_string().as_str()),
     };
+    let conversation = Arc::new(Mutex::new(messages));
+    ctx.conversation = Some(conversation.clone());
+    let look = tools.get("look").is_some();
     let shared = Arc::new(RunShared {
-        conversation: Mutex::new(messages),
+        conversation,
         max_response_bytes: limits.max_response_bytes,
         doom: DoomState::default(),
         tools,
@@ -489,6 +508,7 @@ async fn run_loop(
                 &shared.conversation.lock().await,
                 budget,
                 model.accepts_images(),
+                look,
             );
             // Pruning was not enough: compact, then rebuild the view.
             if budget.is_some_and(|budget| estimate_tokens(&view) > budget)
@@ -499,6 +519,7 @@ async fn run_loop(
                     &shared.conversation.lock().await,
                     budget,
                     model.accepts_images(),
+                    look,
                 )
             } else {
                 view
@@ -564,6 +585,7 @@ async fn run_loop(
                     &shared.conversation.lock().await,
                     budget,
                     model.accepts_images(),
+                    look,
                 );
                 if let Some(budget) = budget {
                     fit_tool_view(&mut view, budget, &shared).await?;
@@ -586,7 +608,7 @@ async fn run_loop(
             ));
         }
         if chat_turn.usage.is_some() {
-            usage = chat_turn.usage;
+            usage.clone_from(&chat_turn.usage);
         }
         let assistant = chat_turn.message;
 
@@ -797,12 +819,21 @@ async fn after_edit(shared: &RunShared, path: &str) -> Result<String> {
 /// The messages to send: stale reasoning stripped and, when over budget, old tool
 /// outputs pruned. The conversation itself keeps everything, so compaction
 /// summarizes original results rather than placeholders.
-fn request_view(conversation: &[Message], budget: Option<usize>, images: bool) -> Vec<Message> {
+fn request_view(
+    conversation: &[Message],
+    budget: Option<usize>,
+    images: bool,
+    look: bool,
+) -> Vec<Message> {
     let mut view = conversation.to_vec();
     strip_stale_reasoning(&mut view);
     if !images {
         for message in view.iter_mut().filter(|message| !message.images.is_empty()) {
-            drop_images(message, IMAGES_NOT_SENT);
+            let note = match &message.tool_call_id {
+                Some(id) if look => crate::tool::look::hint(id),
+                _ => IMAGES_NOT_SENT.to_owned(),
+            };
+            drop_images(message, &note);
         }
     }
     if budget.is_some_and(|budget| estimate_tokens(&view) > budget) {
@@ -983,19 +1014,7 @@ async fn run_turn(
         }
     }
     let turn = accumulator.finish()?;
-    let reported_prompt = turn
-        .usage
-        .as_ref()
-        .map_or(0, |usage| usage.prompt_tokens as usize);
-    let completion = turn.usage.as_ref().map_or_else(
-        || estimate_tokens(std::slice::from_ref(&turn.message)),
-        |usage| usage.completion_tokens as usize,
-    );
-    budget.charge_tokens(
-        reported_prompt
-            .saturating_sub(input_tokens)
-            .saturating_add(completion),
-    )?;
+    budget.charge_reply(input_tokens, &turn)?;
     Ok(turn)
 }
 
@@ -1043,7 +1062,7 @@ async fn execute_calls(
                     images: output.images,
                     ..Message::tool(calls[index].id.clone(), output.text)
                 };
-                shared.commit(turn, message, None).await?;
+                shared.commit(turn, message, output.usage).await?;
                 if token.is_cancelled() {
                     return Err(Error::Cancelled);
                 }
@@ -1235,7 +1254,11 @@ async fn call_tool(
                             "\n[{dropped} image(s) omitted: not a usable PNG, JPEG, WebP or GIF]"
                         ));
                     }
-                    Ok(ToolOutput { text, images })
+                    Ok(ToolOutput {
+                        text,
+                        images,
+                        usage: output.usage,
+                    })
                 }
                 Err(ToolError::Failure(message)) => Ok(format!("Error: {message}").into()),
                 Err(ToolError::Fatal(err)) => Err(err),
@@ -1302,7 +1325,7 @@ mod tests {
             }],
             ..Message::tool("c1", "[image image/png attached]")
         };
-        let view = request_view(std::slice::from_ref(&shot), None, false);
+        let view = request_view(std::slice::from_ref(&shot), None, false, false);
         assert!(view[0].images.is_empty());
         assert_eq!(
             view[0].content.as_deref(),
@@ -1310,7 +1333,7 @@ mod tests {
         );
         assert!(estimate_tokens(&view) < IMAGE_TOKENS);
         assert_eq!(
-            request_view(std::slice::from_ref(&shot), None, true),
+            request_view(std::slice::from_ref(&shot), None, true, false),
             [shot]
         );
     }

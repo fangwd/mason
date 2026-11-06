@@ -746,7 +746,11 @@ impl Tool for McpTool {
             }));
         }
         if !text.is_empty() {
-            return Ok(ToolOutput { text, images });
+            return Ok(ToolOutput {
+                text,
+                images,
+                usage: None,
+            });
         }
         Ok(match &result.structured_content {
             Some(structured) => structured.to_string(),

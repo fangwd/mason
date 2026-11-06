@@ -403,11 +403,9 @@ pub async fn run_to_stdout(agent: &Agent, profile: &str, prompt: &str) -> Result
         let mut expected_seq = 0u32;
         let mut contiguous = true;
         let mut printed = String::new();
-        let mut total = Usage {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-        };
+        let mut total = Usage::default();
         let mut requests = 0u32;
+        let mut unpriced = 0u32;
         // Whether streamed text left the terminal mid-line, so a status line starts
         // on its own line.
         let mut mid_line = false;
@@ -449,21 +447,33 @@ pub async fn run_to_stdout(agent: &Agent, profile: &str, prompt: &str) -> Result
                 RunEvent::Committed {
                     message, tokens, ..
                 } => {
-                    let line = match (message.role, tokens.usage) {
+                    if let Some(usage) = &tokens.usage {
+                        requests += 1;
+                        total.prompt_tokens += usage.prompt_tokens;
+                        total.completion_tokens += usage.completion_tokens;
+                        if let Some(cached) = usage.cached_tokens {
+                            *total.cached_tokens.get_or_insert(0) += cached;
+                        }
+                        match usage.cost {
+                            Some(cost) => *total.cost.get_or_insert(0.0) += cost,
+                            None => unpriced += 1,
+                        }
+                    }
+                    let line = match (message.role, &tokens.usage) {
                         (Role::Assistant, Some(usage)) => {
-                            requests += 1;
-                            total.prompt_tokens += usage.prompt_tokens;
-                            total.completion_tokens += usage.completion_tokens;
-                            format!(
-                                "  [model] {} prompt + {} completion tokens",
-                                usage.prompt_tokens, usage.completion_tokens
-                            )
+                            format!("  [model] {}", usage_line(usage))
                         }
                         (Role::Assistant, None) => format!(
                             "  [model] no usage reported; reply ~{} tokens",
                             tokens.estimated
                         ),
-                        (Role::Tool, _) => format!("  [result] ~{} tokens", tokens.estimated),
+                        // a tool that asked a model itself, as `look` does
+                        (Role::Tool, Some(usage)) => format!(
+                            "  [result] ~{} tokens; [model] {}",
+                            tokens.estimated,
+                            usage_line(usage)
+                        ),
+                        (Role::Tool, None) => format!("  [result] ~{} tokens", tokens.estimated),
                         _ => continue,
                     };
                     end_line(&mut mid_line);
@@ -471,7 +481,7 @@ pub async fn run_to_stdout(agent: &Agent, profile: &str, prompt: &str) -> Result
                 }
             }
         }
-        (printed, total, requests)
+        (printed, total, requests, unpriced)
     });
     // Cancellation lets tools clean up before the event queue closes.
     let token = tokio_util::sync::CancellationToken::new();
@@ -485,7 +495,8 @@ pub async fn run_to_stdout(agent: &Agent, profile: &str, prompt: &str) -> Result
         }
     };
     let interrupted = token.is_cancelled();
-    let (printed, total, requests) = printer.await.expect("the printer task cannot panic");
+    let (printed, total, requests, unpriced) =
+        printer.await.expect("the printer task cannot panic");
     let answer = outcome.answer.as_str();
     // Append any answer suffix lost by the observer queue.
     if let Some(rest) = answer.strip_prefix(&printed) {
@@ -501,15 +512,37 @@ pub async fn run_to_stdout(agent: &Agent, profile: &str, prompt: &str) -> Result
         emit("\n");
     }
     if requests > 0 {
+        let unpriced = if unpriced > 0 && total.cost.is_some() {
+            format!(" ({unpriced} without a price)")
+        } else {
+            String::new()
+        };
         eprintln!(
-            "[tokens] {} prompt + {} completion across {requests} model requests",
-            total.prompt_tokens, total.completion_tokens
+            "[tokens] {} across {requests} model requests{unpriced}",
+            usage_line(&total)
         );
     }
     if !interrupted {
         review_run(agent, &outcome.messages).await;
     }
     Ok(())
+}
+
+/// `model: P prompt (C cached) + N completion tokens, $X`, with what is known.
+fn usage_line(usage: &Usage) -> String {
+    let mut line = String::new();
+    if let Some(model) = &usage.model {
+        line.push_str(&format!("{model}: "));
+    }
+    line.push_str(&format!("{} prompt", usage.prompt_tokens));
+    if let Some(cached) = usage.cached_tokens {
+        line.push_str(&format!(" ({cached} cached)"));
+    }
+    line.push_str(&format!(" + {} completion tokens", usage.completion_tokens));
+    if let Some(cost) = usage.cost {
+        line.push_str(&format!(", ${cost:.4}"));
+    }
+    line
 }
 
 /// Grades a one-shot run, reflects on it and consolidates memory when due: a

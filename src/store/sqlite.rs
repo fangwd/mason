@@ -102,6 +102,9 @@ impl SqliteStore {
                 }
             }
         }
+        // Closing a descriptor drops every lock this process holds on the file,
+        // so close ours before SQLite takes its locks.
+        drop(database);
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)

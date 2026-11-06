@@ -26,6 +26,7 @@ use crate::prompt::{Environment, PromptSet, PromptSource};
 use crate::reflect::{self, RunReview};
 use crate::skill::{Skill, SkillTool, load_skills, skills_entries};
 use crate::store::{Delivery, NewSession, Session, SessionId, SessionStore};
+use crate::tool::look::LookTool;
 use crate::tool::{OutputSpill, Tool, ToolCtx, ToolScope, Toolset};
 
 /// Lists a refreshable tool source's tools again (MCP servers) for a top-level
@@ -82,6 +83,8 @@ struct AgentInner {
     skills_dir: Option<PathBuf>,
     memory: Option<Arc<Memory>>,
     evaluator: Option<Arc<dyn Evaluator>>,
+    /// Answers the `look` tool when the main model takes no images.
+    vision: Option<Arc<dyn ChatModel>>,
     execution_mode: crate::tool::policy::ExecutionMode,
     allow_network: bool,
     policy: Option<Arc<dyn crate::tool::policy::ToolPolicy>>,
@@ -1110,6 +1113,12 @@ fn assemble(
             None => tool,
         }))?;
     }
+    if let Some(vision) = &inner.vision
+        && !inner.model.accepts_images()
+        && profile.allows("look")
+    {
+        tools.push(Box::new(LookTool::new(&prompts.look, vision.clone())))?;
+    }
     if let Some(launch) = launch
         && task_available(profile)
     {
@@ -1258,6 +1267,7 @@ pub struct AgentBuilder {
     skills_dir: Option<PathBuf>,
     memory_dir: Option<PathBuf>,
     evaluator: Option<Arc<dyn Evaluator>>,
+    vision: Option<Arc<dyn ChatModel>>,
     model_timeouts: Option<crate::llm::ModelTimeouts>,
     shell_timeouts: Option<(u64, u64)>,
     execution_mode: crate::tool::policy::ExecutionMode,
@@ -1417,6 +1427,13 @@ impl AgentBuilder {
         self
     }
 
+    /// A model that takes images, for when the main one takes none: runs then get
+    /// the `look` tool, which asks it about the images tools return.
+    pub fn vision(mut self, model: Arc<dyn ChatModel>) -> Self {
+        self.vision = Some(model);
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         if self.selector_conflict {
             return Err(Error::Config(
@@ -1447,6 +1464,15 @@ impl AgentBuilder {
             }
         };
         crate::context::usable_tokens(model.context_tokens())?;
+        if self
+            .vision
+            .as_ref()
+            .is_some_and(|vision| !vision.accepts_images())
+        {
+            return Err(Error::Config(
+                "the vision model does not accept images".to_owned(),
+            ));
+        }
 
         let prompts = self.prompts.unwrap_or(PromptSource::Embedded);
         // Build-time validation of the prompt file; runs re-read it.
@@ -1460,7 +1486,7 @@ impl AgentBuilder {
         // The runtime adds these per run; a base tool with the same name would fail
         // every run's assembly instead of the build.
         let memory_tool = self.memory_dir.is_some().then_some("memory");
-        for reserved in ["skill", "task"].into_iter().chain(memory_tool) {
+        for reserved in ["skill", "task", "look"].into_iter().chain(memory_tool) {
             if tools.get(reserved).is_some() {
                 return Err(Error::Config(format!(
                     "the tool name `{reserved}` is reserved for the runtime"
@@ -1533,6 +1559,7 @@ impl AgentBuilder {
                     .map(|dir| Memory::open(dir).map(Arc::new))
                     .transpose()?,
                 evaluator: self.evaluator,
+                vision: self.vision,
                 execution_mode: self.execution_mode,
                 allow_network: self.allow_network,
                 policy: self.policy,
@@ -1729,7 +1756,7 @@ mod tests {
             }
         }
         let dir = tempfile::tempdir().unwrap();
-        for reserved in ["skill", "task", "memory"] {
+        for reserved in ["skill", "task", "look", "memory"] {
             let err = Agent::builder()
                 .model(Arc::new(AnswerModel("x".into())))
                 .memory_dir(dir.path())
@@ -1744,6 +1771,30 @@ mod tests {
             .tool(Box::new(Named("memory")))
             .build()
             .unwrap();
+
+        struct Blind;
+        #[async_trait::async_trait]
+        impl ChatModel for Blind {
+            fn context_tokens(&self) -> usize {
+                128_000
+            }
+            fn accepts_images(&self) -> bool {
+                false
+            }
+            async fn stream(
+                &self,
+                _request: ChatRequest,
+                _token: &CancellationToken,
+            ) -> Result<ChatStream> {
+                unreachable!("the build fails first")
+            }
+        }
+        let err = Agent::builder()
+            .model(Arc::new(AnswerModel("x".into())))
+            .vision(Arc::new(Blind))
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("vision model"), "{err}");
 
         let mut tools = builtin_tools();
         tools.push(Box::new(Typed(crate::tool::builtin::ReadTool)));

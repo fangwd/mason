@@ -155,6 +155,14 @@ skill:
     {{skills}}
     </available_skills>
 
+look:
+  description: |-
+    Ask a vision model about the images a tool call returned, such as a screenshot. You cannot see images yourself: when a tool result says its images were not sent, call look with that result's call_id and a specific question.
+
+    The answer is all you learn from the images, so ask for exactly what you need: which option is selected, which gallery image is displayed, the text of a badge, how elements are laid out. You may look at the same images again with another question.
+  system: |-
+    You answer questions about images for an agent that cannot see them. Answer only from what the images show, precisely and concisely: quote visible text exactly, give positions and states (selected, highlighted, disabled) when asked, and say plainly when something is not visible or cannot be determined.
+
 memory:
   description: |-
     Read and maintain your persistent memory, shared by every session of this agent.

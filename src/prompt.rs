@@ -70,6 +70,7 @@ pub struct PromptSet {
     pub compaction: CompactionPrompts,
     pub task: TaskPrompts,
     pub skill: SkillPrompts,
+    pub look: LookPrompts,
     pub memory: MemoryPrompts,
     pub reflection: ReflectionPrompts,
     pub consolidation: ConsolidationPrompts,
@@ -112,6 +113,15 @@ pub struct TaskPrompts {
     /// Task description prefix; run assembly appends call limits and allowed child
     /// profiles.
     pub description: String,
+}
+
+/// Look-tool prompts.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LookPrompts {
+    pub description: String,
+    /// System prompt for the vision model answering a look.
+    pub system: String,
 }
 
 /// Skill-tool prompts.
@@ -397,6 +407,8 @@ impl PromptSet {
                 &["transcript"][..],
             ),
             ("evaluation.tool", self.evaluation.tool.as_str(), &[][..]),
+            ("look.description", self.look.description.as_str(), &[][..]),
+            ("look.system", self.look.system.as_str(), &[][..]),
             (
                 "profiles.general.description",
                 self.profiles.general.description.as_str(),
@@ -528,6 +540,11 @@ skill:
     Load a skill.
   section: |-
     <skills>{{skills}}</skills>
+look:
+  description: |-
+    Ask about images.
+  system: |-
+    Describe images.
 memory:
   description: |-
     Manage memories.

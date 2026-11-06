@@ -19,9 +19,9 @@ pub const OUTPUT_RESERVE: usize = 20_000;
 pub const PRUNE_PROTECT: usize = 40_000;
 /// Pruning only happens when it frees more than this many tokens.
 pub const PRUNE_MINIMUM: usize = 20_000;
-/// The estimate for one image: high-resolution models charge up to ~4,800 tokens,
-/// others ~1,600.
-pub const IMAGE_TOKENS: usize = 2_500;
+/// The estimate for one image: a 1440x900 screenshot measured ~1,000 tokens on
+/// DeepSeek; high-resolution models charge more for larger images.
+pub const IMAGE_TOKENS: usize = 1_000;
 /// The placeholder an old tool output is replaced with.
 pub const PRUNED: &str = "[Old tool result content cleared]";
 /// Tool results and tool-call arguments inside a summarization request are
@@ -526,7 +526,7 @@ mod tests {
             data: "aW1n".repeat(100_000),
         };
         let mut messages = vec![user("q")];
-        for n in 1..=40 {
+        for n in 1..=100 {
             messages.push(call(&format!("c{n}")));
             messages.push(Message {
                 images: vec![image.clone()],

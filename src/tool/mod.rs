@@ -13,10 +13,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::Error;
 use crate::error::Result;
-use crate::llm::{Image, ToolSpec};
+use crate::llm::{Image, Message, ToolSpec, Usage};
 
 pub mod builtin;
 pub mod image;
+pub mod look;
 pub mod output;
 pub mod policy;
 pub mod process;
@@ -67,6 +68,8 @@ pub struct ToolCtx {
     pub(crate) access: Option<Arc<RunAccess>>,
     /// Per-session resource scope; different sessions and children never share MCP state.
     pub resources: Arc<std::sync::Mutex<HashMap<String, Arc<dyn std::any::Any + Send + Sync>>>>,
+    /// The current run's conversation, where `look` finds the images it asks about.
+    pub(crate) conversation: Option<Arc<Mutex<Vec<Message>>>>,
 }
 
 /// A run's tools, constraints and edits. Children retain their parent's journal
@@ -136,6 +139,7 @@ impl ToolCtx {
             policy: Arc::new(policy::AllowTools),
             access: None,
             resources: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            conversation: None,
         }
     }
 
@@ -224,13 +228,15 @@ impl ToolCtx {
 pub struct ToolOutput {
     pub text: String,
     pub images: Vec<Image>,
+    /// The provider's usage when the tool itself asked a model, as `look` does.
+    pub usage: Option<Usage>,
 }
 
 impl From<String> for ToolOutput {
     fn from(text: String) -> Self {
         Self {
             text,
-            images: Vec::new(),
+            ..Self::default()
         }
     }
 }

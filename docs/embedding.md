@@ -90,6 +90,13 @@ Extension points — and nothing else — are how a domain app customises mason:
       builder = builder.evaluator(Arc::new(LlmEvaluator::new(Arc::new(judge))));
   }
   ```
+- **Vision** — `AgentBuilder::vision` takes a model that accepts images. When
+  the main model accepts none, each run gets a `look` tool, and the vision
+  model answers its questions about the images tools return; those requests
+  count against the run's token budget. `look` is always a reserved tool name.
+  As with the evaluator, only the `into_builder` methods read
+  `AI_VISION_VENDORS`, each of which must accept images; otherwise pass
+  `VendorModel::new(vendors)` from `Vendors::vision_from_env()`.
 - **`SessionStore`** — SQLite by default (`SqliteStore`), any backend by
   trait.
 - **`ChatModel`** — OpenAI-compatible vendor failover with streaming by

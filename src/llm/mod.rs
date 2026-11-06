@@ -94,6 +94,54 @@ pub struct Vendor {
     /// `false` (`AI_<NAME>_IMAGES=false`) leaves tool images out of requests,
     /// for models without image input.
     pub images: bool,
+    /// What the model costs (`AI_<NAME>_PRICE`); turns record their cost.
+    pub price: Option<Price>,
+}
+
+/// USD per million tokens: `AI_<NAME>_PRICE` is `input,output` or
+/// `input,output,cached`, where cached prompt tokens cost `input` when unset.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Price {
+    pub input: f64,
+    pub output: f64,
+    pub cached: f64,
+}
+
+impl Price {
+    fn parse(raw: &str) -> Option<Self> {
+        let prices: Vec<f64> = raw
+            .split(',')
+            .map(|price| {
+                price
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|price| price.is_finite() && *price >= 0.0)
+            })
+            .collect::<Option<_>>()?;
+        match prices[..] {
+            [input, output] => Some(Self {
+                input,
+                output,
+                cached: input,
+            }),
+            [input, output, cached] => Some(Self {
+                input,
+                output,
+                cached,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The cost of one turn's usage in USD.
+    pub fn cost(&self, usage: &Usage) -> f64 {
+        let cached = usage.cached_tokens.unwrap_or(0).min(usage.prompt_tokens);
+        (f64::from(usage.prompt_tokens - cached) * self.input
+            + f64::from(cached) * self.cached
+            + f64::from(usage.completion_tokens) * self.output)
+            / 1_000_000.0
+    }
 }
 
 /// The configured vendors, in failover order.
@@ -115,11 +163,41 @@ impl Vendors {
     /// The [`evaluator_from_env`](Self::evaluator_from_env) contract against an
     /// injectable lookup.
     pub fn evaluator_from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>> {
-        if get("AI_EVALUATOR_VENDORS").is_none_or(|names| names.trim().is_empty()) {
+        Self::listed_from_lookup("AI_EVALUATOR_VENDORS", get)
+    }
+
+    /// The vision vendors the `look` tool asks about images when the main model
+    /// takes none: `AI_VISION_VENDORS`, like `AI_EVALUATOR_VENDORS`.
+    pub fn vision_from_env() -> Result<Option<Self>> {
+        Self::vision_from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// The [`vision_from_env`](Self::vision_from_env) contract against an
+    /// injectable lookup.
+    pub fn vision_from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>> {
+        let vision = Self::listed_from_lookup("AI_VISION_VENDORS", get)?;
+        // A failover vendor without images would answer without seeing them.
+        if let Some(vendor) = vision.iter().flat_map(|v| &v.0).find(|v| !v.images) {
+            return Err(Error::Config(format!(
+                "vision vendor {} must accept images (AI_{}_IMAGES)",
+                vendor.name,
+                vendor.name.to_uppercase()
+            )));
+        }
+        Ok(vision)
+    }
+
+    /// The vendors `list` names, configured by the `AI_<NAME>_*` variables;
+    /// `None` when it is unset.
+    fn listed_from_lookup(
+        list: &str,
+        get: impl Fn(&str) -> Option<String>,
+    ) -> Result<Option<Self>> {
+        if get(list).is_none_or(|names| names.trim().is_empty()) {
             return Ok(None);
         }
         Self::from_lookup(|key| match key {
-            "AI_VENDORS" => get("AI_EVALUATOR_VENDORS"),
+            "AI_VENDORS" => get(list),
             _ => get(key),
         })
         .map(Some)
@@ -175,6 +253,14 @@ impl Vendors {
             };
             let stream = optional_bool(&get, &prefix, "STREAM")?.unwrap_or(true);
             let images = optional_bool(&get, &prefix, "IMAGES")?.unwrap_or(true);
+            let price = match get(&format!("{prefix}PRICE")) {
+                Some(raw) if !raw.trim().is_empty() => Some(Price::parse(&raw).ok_or_else(|| {
+                    Error::Config(format!(
+                        "{prefix}PRICE must be `input,output` or `input,output,cached` USD per million tokens"
+                    ))
+                })?),
+                _ => None,
+            };
             let extra_body = json_object(&get, &prefix, "EXTRA_BODY")?;
             if let Some(reserved) = extra_body
                 .keys()
@@ -208,6 +294,7 @@ impl Vendors {
                 headers,
                 stream,
                 images,
+                price,
             });
         }
         Ok(Self(vendors))
@@ -439,9 +526,13 @@ impl TurnState {
 
     async fn advance(&mut self) -> Option<Result<ChatDelta>> {
         loop {
-            if let Some(delta) = self.pending.pop_front() {
-                // Usage is bookkeeping: a retry after it duplicates no output.
-                if !matches!(delta, ChatDelta::Usage { .. }) {
+            if let Some(mut delta) = self.pending.pop_front() {
+                if let ChatDelta::Usage(usage) = &mut delta {
+                    let vendor = &self.vendors[self.vendor];
+                    usage.model = Some(vendor.model.clone());
+                    usage.cost = vendor.price.map(|price| price.cost(usage));
+                } else {
+                    // Usage is bookkeeping: a retry after it duplicates no output.
                     self.forwarded = true;
                 }
                 if matches!(delta, ChatDelta::Done { .. }) {
@@ -944,6 +1035,7 @@ mod tests {
                     headers: Default::default(),
                     stream: stream_mode,
                     images: true,
+                    price: None,
                 })
                 .collect(),
         )
@@ -1690,9 +1782,75 @@ mod tests {
             turn.usage,
             Some(Usage {
                 prompt_tokens: 11,
-                completion_tokens: 7
+                completion_tokens: 7,
+                model: Some("m".into()),
+                ..Default::default()
             })
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn usage_records_cached_tokens_and_the_cost_at_the_vendors_price() {
+        let mut priced = vendors(1, true);
+        priced.0[0].price = Price::parse("0.30, 1.20, 0.006");
+        let deepseek = json!({"prompt_tokens": 1_000_000, "completion_tokens": 100_000,
+            "prompt_cache_hit_tokens": 800_000});
+        let openai = json!({"prompt_tokens": 1_000_000, "completion_tokens": 100_000,
+            "prompt_tokens_details": {"cached_tokens": 800_000}});
+        for usage in [deepseek, openai] {
+            let turn = fold_with(
+                priced.clone(),
+                vec![ok_stream(vec![
+                    text_event("hi"),
+                    finish_event("stop"),
+                    event(json!({"choices": [], "usage": usage})),
+                    done_event(),
+                ])],
+            )
+            .await;
+            let usage = turn.usage.unwrap();
+            assert_eq!(usage.cached_tokens, Some(800_000));
+            assert_eq!(usage.model.as_deref(), Some("m"));
+            // 200k uncached at $0.30, 800k cached at $0.006, 100k out at $1.20
+            let cost = usage.cost.unwrap();
+            assert!((cost - (0.06 + 0.0048 + 0.12)).abs() < 1e-9, "{cost}");
+        }
+
+        let miss = json!({"prompt_tokens": 10, "completion_tokens": 1,
+            "prompt_cache_hit_tokens": 0});
+        let turn = fold_with(
+            priced,
+            vec![ok_stream(vec![
+                text_event("hi"),
+                finish_event("stop"),
+                event(json!({"choices": [], "usage": miss})),
+                done_event(),
+            ])],
+        )
+        .await;
+        assert_eq!(
+            turn.usage.unwrap().cached_tokens,
+            None,
+            "a miss is no cache hit"
+        );
+    }
+
+    #[test]
+    fn prices_are_two_or_three_non_negative_numbers() {
+        let price = Price::parse("1, 2").unwrap();
+        assert_eq!((price.input, price.output, price.cached), (1.0, 2.0, 1.0));
+        for bad in ["1", "1,2,3,4", "1,-2", "a,b", "1,NaN"] {
+            assert_eq!(Price::parse(bad), None, "{bad}");
+        }
+        let err = Vendors::from_lookup(|key| match key {
+            "AI_VENDORS" => Some("x".into()),
+            "AI_X_URL" => Some("https://x.test".into()),
+            "AI_X_MODEL" => Some("m".into()),
+            "AI_X_PRICE" => Some("cheap".into()),
+            _ => None,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("AI_X_PRICE"), "{err}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1776,7 +1934,9 @@ mod tests {
             streamed.usage,
             Some(Usage {
                 prompt_tokens: 11,
-                completion_tokens: 7
+                completion_tokens: 7,
+                model: Some("m".into()),
+                ..Default::default()
             })
         );
     }
@@ -1911,6 +2071,32 @@ mod tests {
         let incomplete = |key: &str| (key == "AI_EVALUATOR_VENDORS").then(|| "mini".to_owned());
         let err = Vendors::evaluator_from_lookup(incomplete).unwrap_err();
         assert!(err.to_string().contains("AI_MINI_URL"), "{err}");
+    }
+
+    #[test]
+    fn vision_vendors_share_the_vendor_variables() {
+        let lookup = |key: &str| {
+            match key {
+                "AI_VISION_VENDORS" => Some("eyes"),
+                "AI_EYES_URL" => Some("https://eyes.test"),
+                "AI_EYES_MODEL" => Some("small-vl"),
+                _ => None,
+            }
+            .map(str::to_owned)
+        };
+        let vision = Vendors::vision_from_lookup(lookup).unwrap().unwrap();
+        assert_eq!(vision.as_slice()[0].model, "small-vl");
+        assert!(Vendors::vision_from_lookup(|_| None).unwrap().is_none());
+
+        let blind_fallback = |key: &str| match key {
+            "AI_VISION_VENDORS" => Some("eyes,blind".to_owned()),
+            "AI_BLIND_URL" => Some("https://blind.test".to_owned()),
+            "AI_BLIND_MODEL" => Some("text".to_owned()),
+            "AI_BLIND_IMAGES" => Some("false".to_owned()),
+            _ => lookup(key),
+        };
+        let err = Vendors::vision_from_lookup(blind_fallback).unwrap_err();
+        assert!(err.to_string().contains("AI_BLIND_IMAGES"), "{err}");
     }
 
     #[test]

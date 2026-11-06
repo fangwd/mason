@@ -45,12 +45,18 @@ admission capacity return 429 before storing a new input.
 ## Events
 
 Committed events are the source of truth and carry monotonic IDs: `message`
-(`{message, turn}`), `run.started`, `run.finished` (`{answer}`),
+(`{message, turn, tokens}`), `run.started`, `run.finished` (`{answer}`),
 `run.interrupted`, `run.failed` (`{error}`), `subagent.started`
 (`{sessionId, agent, description}`) and, with an evaluator configured,
 `run.evaluated` (`{outcome, reason}`, outcome `success`, `partial`, `failure`
 or `unclear`). `run.evaluated` follows its run's terminal event and carries
 its `runId`; a client that stops reading at the terminal event misses it.
+
+A `message` event's `tokens` holds `estimated`, mason's estimate of the
+message, and on a model reply (or a `look` result) `usage`: the provider's
+`prompt_tokens` and `completion_tokens`, `cached_tokens` when the provider
+reports a cache hit, `model`, and `cost` in USD when the vendor has a price
+(`AI_<NAME>_PRICE`). The cost is fixed when the turn is recorded.
 
 `GET /sessions/:id/events` returns a JSON page (`after` cursor, `limit`
 default 500, max 1000) or, with `Accept: text/event-stream`, an SSE stream:

@@ -85,10 +85,10 @@ impl Profile {
         }
     }
 
-    /// Whether this profile allows the runtime-owned tool `name`: `skill` only
-    /// reads; `task` and `memory` may not.
+    /// Whether this profile allows the runtime-owned tool `name`: `skill` and
+    /// `look` only read; `task` and `memory` may not.
     pub fn allows(&self, name: &str) -> bool {
-        self.admits(name, name == "skill")
+        self.admits(name, matches!(name, "skill" | "look"))
     }
 }
 
@@ -505,7 +505,7 @@ impl ProfileSet {
             }
             if let Some(names) = &profile.tools {
                 for name in names {
-                    if name == "skill" || name == "task" {
+                    if matches!(name.as_str(), "skill" | "task" | "look") {
                         continue; // runtime-owned, assembled per run
                     }
                     let found = if name.contains('*') {

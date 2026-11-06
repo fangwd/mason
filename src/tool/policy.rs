@@ -51,7 +51,7 @@ impl ToolPolicy for CliPolicy {
                 let key = if name == "bash" { "workdir" } else { "path" };
                 ctx.checked_path(args.get(key).and_then(Value::as_str).unwrap_or("."))?;
             }
-            "skill" | "task" | "process" => {}
+            "skill" | "task" | "process" | "look" => {}
             _ if self.allow_mcp => {}
             _ => {
                 return Err(ToolError::failure(
@@ -462,5 +462,27 @@ impl Tool for IsolatedFileTool {
         result
             .map(super::ToolOutput::from)
             .map_err(ToolError::failure)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn runtime_tools_need_no_grant_and_external_ones_do() {
+        let policy = CliPolicy { allow_mcp: false };
+        let ctx = ToolCtx::new(".");
+        for name in ["skill", "task", "process", "look"] {
+            policy.authorize(name, &Value::Null, &ctx).await.unwrap();
+        }
+        let err = policy
+            .authorize("browser_navigate", &Value::Null, &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ToolError::Failure(m) if m.contains("--allow-mcp")),
+            "{err:?}"
+        );
     }
 }

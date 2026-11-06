@@ -369,10 +369,11 @@ async fn usage_is_recorded_and_estimates_still_drive_compaction() {
                 if main_turns.fetch_add(1, Ordering::SeqCst) == 0 {
                     Reply::Deltas(vec![
                         ChatDelta::Text("partial".into()),
-                        ChatDelta::Usage {
+                        ChatDelta::Usage(mason::llm::Usage {
                             prompt_tokens: 1,
                             completion_tokens: 1,
-                        },
+                            ..Default::default()
+                        }),
                         ChatDelta::ToolCall {
                             index: 0,
                             id: Some("b1".into()),
@@ -403,7 +404,8 @@ async fn usage_is_recorded_and_estimates_still_drive_compaction() {
         outcome.usage,
         Some(Usage {
             prompt_tokens: 1,
-            completion_tokens: 1
+            completion_tokens: 1,
+            ..Default::default()
         })
     );
 
