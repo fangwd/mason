@@ -86,7 +86,10 @@ mod tests {
 
     async fn glob(dir: &Path, args: serde_json::Value) -> Result<String, ToolError> {
         let ctx = ToolCtx::new(dir).with_spill(Arc::new(OutputSpill::new(dir.join("spill"))));
-        Typed(GlobTool).call(args, &ctx).await
+        Typed(GlobTool)
+            .call(args, &ctx)
+            .await
+            .map(|output| output.text)
     }
 
     #[tokio::test]

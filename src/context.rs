@@ -19,6 +19,9 @@ pub const OUTPUT_RESERVE: usize = 20_000;
 pub const PRUNE_PROTECT: usize = 40_000;
 /// Pruning only happens when it frees more than this many tokens.
 pub const PRUNE_MINIMUM: usize = 20_000;
+/// The estimate for one image: high-resolution models charge up to ~4,800 tokens,
+/// others ~1,600.
+pub const IMAGE_TOKENS: usize = 2_500;
 /// The placeholder an old tool output is replaced with.
 pub const PRUNED: &str = "[Old tool result content cleared]";
 /// Tool results and tool-call arguments inside a summarization request are
@@ -43,7 +46,7 @@ fn estimate_message(message: &Message) -> usize {
         .as_ref()
         .and_then(|calls| serde_json::to_string(calls).ok())
         .map_or(0, |json| json.len());
-    content + reasoning + calls
+    content + reasoning + calls + message.images.len() * IMAGE_TOKENS * 4
 }
 
 /// The same estimator for a serialized payload (tool specs, prompt text).
@@ -113,6 +116,7 @@ pub fn prune_with_budget(messages: &[Message], budget: usize) -> Vec<Message> {
             if cleared.contains(&index) {
                 Message {
                     content: Some(PRUNED.to_owned()),
+                    images: Vec::new(),
                     ..message.clone()
                 }
             } else {
@@ -438,6 +442,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            images: Vec::new(),
         }
     }
 
@@ -448,6 +453,7 @@ mod tests {
             tool_calls: Some(vec![ToolCall::new(id, "bash", "{}")]),
             tool_call_id: None,
             reasoning_content: None,
+            images: Vec::new(),
         }
     }
 
@@ -514,6 +520,31 @@ mod tests {
     }
 
     #[test]
+    fn images_count_toward_estimates_and_are_pruned_with_their_results() {
+        let image = crate::llm::Image {
+            mime_type: "image/png".into(),
+            data: "aW1n".repeat(100_000),
+        };
+        let mut messages = vec![user("q")];
+        for n in 1..=40 {
+            messages.push(call(&format!("c{n}")));
+            messages.push(Message {
+                images: vec![image.clone()],
+                ..result(&format!("c{n}"), 1)
+            });
+        }
+        let shot = &messages[2];
+        assert_eq!(
+            estimate_tokens(std::slice::from_ref(shot)),
+            1 + IMAGE_TOKENS,
+            "an image costs a fixed estimate, not its base64 size"
+        );
+        let pruned = prune(&messages);
+        assert!(pruned[2].images.is_empty() && pruned[2].content.as_deref() == Some(PRUNED));
+        assert_eq!(pruned.last().unwrap().images.len(), 1);
+    }
+
+    #[test]
     fn prune_works_within_a_single_user_turn() {
         let mut messages = vec![user("q")];
         for n in 1..=5 {
@@ -542,6 +573,7 @@ mod tests {
             ),
             tool_call_id: None,
             reasoning_content: None,
+            images: Vec::new(),
         });
         for id in ["c2", "c3", "c4"] {
             messages.push(result(id, 30_000));
@@ -570,6 +602,7 @@ mod tests {
     fn stale_reasoning_is_stripped_before_the_latest_user_message() {
         let reasoned = |text: &str| Message {
             reasoning_content: Some("why".into()),
+            images: Vec::new(),
             ..call(text)
         };
         let mut messages = vec![

@@ -16,12 +16,17 @@ use tokio::time::{Instant, sleep, sleep_until};
 use tokio_util::sync::CancellationToken;
 
 use crate::Error;
-use crate::context::{estimate_str, estimate_tokens, prune_with_budget, strip_stale_reasoning};
+use crate::context::{
+    IMAGE_TOKENS, estimate_str, estimate_tokens, prune_with_budget, strip_stale_reasoning,
+};
 use crate::error::Result;
+use crate::llm::message::IMAGES_NOT_SENT;
 use crate::llm::message::TurnAccumulator;
-use crate::llm::{ChatDelta, ChatModel, ChatRequest, ChatTurn, LlmError, Message, ToolCall, Usage};
+use crate::llm::{
+    ChatDelta, ChatModel, ChatRequest, ChatTurn, LlmError, Message, Role, ToolCall, Usage,
+};
 use crate::prompt::PromptSet;
-use crate::tool::{Keep, ToolCtx, ToolError, Toolset};
+use crate::tool::{Keep, ToolCtx, ToolError, ToolOutput, Toolset};
 
 /// Repeated identical calls within the sliding window trigger a warning.
 const DOOM_LOOP_THRESHOLD: usize = 3;
@@ -124,6 +129,7 @@ pub enum RunEvent {
         run_id: Arc<str>,
         turn: u32,
         message: Message,
+        tokens: MessageTokens,
     },
     /// A tool call is about to execute.
     #[serde(rename_all = "camelCase")]
@@ -136,12 +142,25 @@ pub enum RunEvent {
     },
 }
 
+/// The token counts logged with a committed message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MessageTokens {
+    /// Mason's estimate of the message's size in context.
+    pub estimated: usize,
+    /// The provider's reported usage for the request that produced a model reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
 /// Bounded event queue handle for [`RunConfig::events`].
 pub type EventSink = mpsc::Sender<RunEvent>;
 
 /// Persists a completed message; failure stops the run.
-pub type PersistFn =
-    Arc<dyn Fn(u32, Message) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
+pub type PersistFn = Arc<
+    dyn Fn(u32, Message, MessageTokens) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
 /// Pulls already-saved steering messages between steps.
 pub type SteerFn =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Vec<Message>>> + Send>> + Send + Sync>;
@@ -300,12 +319,16 @@ struct RunShared {
 impl RunShared {
     /// Persists messages in conversation order, allowing bounded cleanup after
     /// cancellation.
-    async fn commit(&self, turn: u32, message: Message) -> Result<()> {
+    async fn commit(&self, turn: u32, message: Message, usage: Option<Usage>) -> Result<()> {
+        let tokens = MessageTokens {
+            estimated: estimate_tokens(std::slice::from_ref(&message)),
+            usage,
+        };
         // Hold the lock through persistence to preserve durable conversation order.
         let mut conversation = self.conversation.lock().await;
         conversation.push(message.clone());
         if let Some(persist) = &self.persist {
-            let mut future = persist(turn, message.clone());
+            let mut future = persist(turn, message.clone(), tokens);
             tokio::select! {
                 result = &mut future => result?,
                 () = self.ctx.token.cancelled() => {
@@ -320,6 +343,7 @@ impl RunShared {
             run_id: self.run_id.clone(),
             turn,
             message,
+            tokens,
         });
         Ok(())
     }
@@ -461,13 +485,21 @@ async fn run_loop(
         }
         let budget = max_tokens.map(|max_tokens| max_tokens.saturating_sub(spec_tokens));
         let mut view = {
-            let view = request_view(&shared.conversation.lock().await, budget);
+            let view = request_view(
+                &shared.conversation.lock().await,
+                budget,
+                model.accepts_images(),
+            );
             // Pruning was not enough: compact, then rebuild the view.
             if budget.is_some_and(|budget| estimate_tokens(&view) > budget)
                 && let Some(compact) = &compact
                 && compact_in_place(compact, &shared, &token).await?
             {
-                request_view(&shared.conversation.lock().await, budget)
+                request_view(
+                    &shared.conversation.lock().await,
+                    budget,
+                    model.accepts_images(),
+                )
             } else {
                 view
             }
@@ -528,7 +560,11 @@ async fn run_loop(
             // Compact once and retry if the provider rejects the context estimate.
             let err = turn.unwrap_err();
             if compact_in_place(compact, &shared, &token).await? {
-                let mut view = request_view(&shared.conversation.lock().await, budget);
+                let mut view = request_view(
+                    &shared.conversation.lock().await,
+                    budget,
+                    model.accepts_images(),
+                );
                 if let Some(budget) = budget {
                     fit_tool_view(&mut view, budget, &shared).await?;
                 }
@@ -554,7 +590,9 @@ async fn run_loop(
         }
         let assistant = chat_turn.message;
 
-        shared.commit(step as u32, assistant.clone()).await?;
+        shared
+            .commit(step as u32, assistant.clone(), chat_turn.usage)
+            .await?;
 
         let calls = assistant.tool_calls.clone().unwrap_or_default();
         if recovering
@@ -568,7 +606,7 @@ async fn run_loop(
                 shared.commit(step as u32, Message::tool(
                     call.id.clone(),
                     "Error: no tools executed because this reply called a tool disabled during doom-loop recovery.",
-                )).await?;
+                ), None).await?;
             }
             return Err(Error::Run(format!(
                 "Stopped after {MAX_DOOM_LOOP_WARNINGS} doom-loop warnings: the model repeated a disabled tool during recovery"
@@ -591,6 +629,7 @@ async fn run_loop(
                         "[Mason runtime check] This profile checks edited files before a run \
                          may finish, and some checks failed:\n\n{failures}\n\nFix them, then finish."
                     )),
+                    None,
                 )
                 .await?;
             continue;
@@ -679,7 +718,7 @@ async fn hook_call(
         return Err(Error::Cancelled);
     }
     match tool.call(args, ctx).await {
-        Ok(output) => Ok((true, output)),
+        Ok(output) => Ok((true, output.text)),
         Err(ToolError::Failure(message)) => Ok((false, message)),
         Err(ToolError::Fatal(err)) => Err(err),
     }
@@ -758,18 +797,71 @@ async fn after_edit(shared: &RunShared, path: &str) -> Result<String> {
 /// The messages to send: stale reasoning stripped and, when over budget, old tool
 /// outputs pruned. The conversation itself keeps everything, so compaction
 /// summarizes original results rather than placeholders.
-fn request_view(conversation: &[Message], budget: Option<usize>) -> Vec<Message> {
+fn request_view(conversation: &[Message], budget: Option<usize>, images: bool) -> Vec<Message> {
     let mut view = conversation.to_vec();
     strip_stale_reasoning(&mut view);
+    if !images {
+        for message in view.iter_mut().filter(|message| !message.images.is_empty()) {
+            drop_images(message, IMAGES_NOT_SENT);
+        }
+    }
     if budget.is_some_and(|budget| estimate_tokens(&view) > budget) {
         view = prune_with_budget(&view, budget.unwrap_or(usize::MAX));
     }
     view
 }
 
+/// Clears a message's images, noting why in its text; returns the estimated
+/// tokens freed.
+fn drop_images(message: &mut Message, note: &str) -> usize {
+    let freed = message.images.len() * IMAGE_TOKENS;
+    message.images.clear();
+    let note = format!("\n{note}");
+    let added = note.len().div_ceil(4);
+    message.content.get_or_insert_default().push_str(&note);
+    freed.saturating_sub(added)
+}
+
 /// Only the sent view is shortened. Conversation/compaction retain the original
 /// results, and the model can page the saved content through read/grep.
 async fn fit_tool_view(view: &mut [Message], budget: usize, shared: &RunShared) -> Result<()> {
+    const DROPPED: &str = "[Images dropped for context]";
+    let mut tokens = estimate_tokens(view);
+    if tokens <= budget {
+        return Ok(());
+    }
+    // Images the model has already seen go first, oldest first.
+    let unseen = view
+        .iter()
+        .rposition(|message| message.role == Role::Assistant)
+        .map_or(0, |index| index + 1);
+    for message in view[..unseen].iter_mut() {
+        if tokens <= budget {
+            return Ok(());
+        }
+        if !message.images.is_empty() {
+            tokens = tokens.saturating_sub(drop_images(message, DROPPED));
+        }
+    }
+    if tokens <= budget {
+        return Ok(());
+    }
+    // New images go only if they cannot fit even with every tool text shortened.
+    let tool_text: usize = view
+        .iter()
+        .filter(|message| message.role == Role::Tool)
+        .map(|message| message.content.as_ref().map_or(0, String::len))
+        .sum();
+    let mut base = tokens.saturating_sub(tool_text / 4);
+    for message in view[unseen..].iter_mut() {
+        if base < budget {
+            break;
+        }
+        if !message.images.is_empty() {
+            base = base.saturating_sub(message.images.len() * IMAGE_TOKENS);
+            drop_images(message, DROPPED);
+        }
+    }
     if estimate_tokens(view) <= budget {
         return Ok(());
     }
@@ -947,9 +1039,11 @@ async fn execute_calls(
                     turn,
                 )
                 .await?;
-                shared
-                    .commit(turn, Message::tool(calls[index].id.clone(), output))
-                    .await?;
+                let message = Message {
+                    images: output.images,
+                    ..Message::tool(calls[index].id.clone(), output.text)
+                };
+                shared.commit(turn, message, None).await?;
                 if token.is_cancelled() {
                     return Err(Error::Cancelled);
                 }
@@ -1012,24 +1106,25 @@ async fn handle_call(
     tasks_used: &AtomicUsize,
     token: &CancellationToken,
     turn: u32,
-) -> Result<String> {
+) -> Result<ToolOutput> {
     let name = &call.function.name;
     if shared.doom.warnings() >= MAX_DOOM_LOOP_WARNINGS {
         return Ok(
             "Error: tool skipped because repeated calls exhausted the doom-loop warning budget."
-                .to_owned(),
+                .to_owned()
+                .into(),
         );
     }
     const OVER_LIMIT: &str = "Error: tool skipped because this reply exceeded its tool/task call limit. Narrow the work.";
     if index >= limits.max_tool_calls_per_step {
-        return Ok(OVER_LIMIT.to_owned());
+        return Ok(OVER_LIMIT.to_owned().into());
     }
     // Count task calls only once they passed the per-reply index check, so which
     // ones run does not depend on worker scheduling.
     if name == "task"
         && tasks_used.fetch_add(1, Ordering::SeqCst) + 1 > limits.max_task_calls_per_step
     {
-        return Ok(OVER_LIMIT.to_owned());
+        return Ok(OVER_LIMIT.to_owned().into());
     }
 
     let key = call_key(call);
@@ -1044,7 +1139,7 @@ async fn handle_call(
     let mut output = call_tool(shared, call, token).await?;
     if repeats >= DOOM_LOOP_THRESHOLD {
         shared.doom.warn(name);
-        output.push_str(&format!(
+        output.text.push_str(&format!(
             "\n\nYou have made this exact {name} call {repeats} times in your last {DOOM_LOOP_WINDOW} calls. Stop repeating it and try a different approach."
         ));
     }
@@ -1056,7 +1151,7 @@ async fn call_tool(
     shared: &RunShared,
     call: &ToolCall,
     token: &CancellationToken,
-) -> Result<String> {
+) -> Result<ToolOutput> {
     if token.is_cancelled() {
         return Err(Error::Cancelled);
     }
@@ -1065,7 +1160,8 @@ async fn call_tool(
         return Ok(format!(
             "Error: unknown tool \"{name}\". Available tools: {}",
             shared.tools.names().join(", ")
-        ));
+        )
+        .into());
     };
     let raw = if call.function.arguments.trim().is_empty() {
         "{}"
@@ -1077,14 +1173,17 @@ async fn call_tool(
         Err(err) => {
             return Ok(format!(
                 "Error: the {name} arguments are not valid JSON ({err}). Rewrite the call."
-            ));
+            )
+            .into());
         }
     };
     let ctx = shared.ctx.clone().with_token(token.clone());
     let budget = ctx.budget.as_ref().expect("run budget");
     if budget.calls.fetch_add(1, Ordering::SeqCst) >= budget.max_calls {
         return Ok(
-            "Error: tool skipped because the run's tool-call budget is exhausted.".to_owned(),
+            "Error: tool skipped because the run's tool-call budget is exhausted."
+                .to_owned()
+                .into(),
         );
     }
     let _permit = if name == "task" {
@@ -1100,14 +1199,14 @@ async fn call_tool(
         authorized = ctx.policy.authorize(name, &args, &ctx) => {
             if let Err(err) = authorized {
                 return match err {
-                    ToolError::Failure(message) => Ok(format!("Error: permission denied: {message}")),
+                    ToolError::Failure(message) => Ok(format!("Error: permission denied: {message}").into()),
                     ToolError::Fatal(err) => Err(err),
                 };
             }
         }
     }
     if let Some(denied) = ctx.check_rules(name, &args) {
-        return Ok(format!("Error: permission denied: {denied}"));
+        return Ok(format!("Error: permission denied: {denied}").into());
     }
     let edited = matches!(name.as_str(), "write" | "edit")
         .then(|| args.get("filePath").and_then(Value::as_str))
@@ -1126,11 +1225,19 @@ async fn call_tool(
                         .expect("edited files")
                         .insert(path.clone());
                 }
-                output.push_str(&after_edit(shared, &path).await?);
+                output.text.push_str(&after_edit(shared, &path).await?);
             }
-            match shared.ctx.spill.truncate(&output, Keep::Head).await {
-                Ok(text) => Ok(text),
-                Err(ToolError::Failure(message)) => Ok(format!("Error: {message}")),
+            match shared.ctx.spill.truncate(&output.text, Keep::Head).await {
+                Ok(mut text) => {
+                    let (images, dropped) = crate::tool::image::bound_images(output.images).await;
+                    if dropped > 0 {
+                        text.push_str(&format!(
+                            "\n[{dropped} image(s) omitted: not a usable PNG, JPEG, WebP or GIF]"
+                        ));
+                    }
+                    Ok(ToolOutput { text, images })
+                }
+                Err(ToolError::Failure(message)) => Ok(format!("Error: {message}").into()),
                 Err(ToolError::Fatal(err)) => Err(err),
             }
         }
@@ -1144,6 +1251,7 @@ async fn call_tool(
                 .spill
                 .truncate(&format!("Error: {message}"), Keep::Head)
                 .await
+                .map(ToolOutput::from)
                 .map_err(|err| match err {
                     ToolError::Fatal(err) => err,
                     ToolError::Failure(_) => Error::Run("cannot bound failed tool output".into()),
@@ -1184,6 +1292,28 @@ fn call_key(call: &ToolCall) -> String {
 mod tests {
     use super::*;
     use ToolCall;
+
+    #[test]
+    fn models_without_image_input_get_no_images_and_no_image_tokens() {
+        let shot = Message {
+            images: vec![crate::llm::Image {
+                mime_type: "image/png".into(),
+                data: "aW1n".into(),
+            }],
+            ..Message::tool("c1", "[image image/png attached]")
+        };
+        let view = request_view(std::slice::from_ref(&shot), None, false);
+        assert!(view[0].images.is_empty());
+        assert_eq!(
+            view[0].content.as_deref(),
+            Some(format!("[image image/png attached]\n{IMAGES_NOT_SENT}").as_str())
+        );
+        assert!(estimate_tokens(&view) < IMAGE_TOKENS);
+        assert_eq!(
+            request_view(std::slice::from_ref(&shot), None, true),
+            [shot]
+        );
+    }
 
     fn call(name: &str, arguments: &str) -> ToolCall {
         ToolCall::new("id", name, arguments)

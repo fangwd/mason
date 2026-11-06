@@ -253,7 +253,7 @@ impl mason::Tool for LargeFailure {
     fn spec(&self) -> mason::ToolSpec {
         mason::ToolSpec::function("fail", "large error", json!({"type":"object"}))
     }
-    async fn call(&self, _: Value, _: &ToolCtx) -> Result<String, ToolError> {
+    async fn call(&self, _: Value, _: &ToolCtx) -> Result<mason::ToolOutput, ToolError> {
         Err(ToolError::failure("x".repeat(100_000)))
     }
 }

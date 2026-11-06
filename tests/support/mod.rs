@@ -10,7 +10,8 @@ use std::time::Duration;
 use futures_util::{StreamExt, stream};
 use mason::{
     CancellationToken, ChatDelta, ChatModel, ChatRequest, ChatStream, Error, LlmError, Message,
-    OutputSpill, PromptSource, Result, Role, RunConfig, Tool, ToolCtx, ToolError, ToolSpec,
+    OutputSpill, PromptSource, Result, Role, RunConfig, Tool, ToolCtx, ToolError, ToolOutput,
+    ToolSpec,
 };
 
 /// One scripted model turn.
@@ -301,9 +302,9 @@ impl Tool for EchoTool {
         &self,
         _args: serde_json::Value,
         _ctx: &ToolCtx,
-    ) -> std::result::Result<String, ToolError> {
+    ) -> std::result::Result<ToolOutput, ToolError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(self.output.clone())
+        Ok(self.output.clone().into())
     }
 }
 
@@ -342,7 +343,7 @@ impl Tool for HeldTaskTool {
         &self,
         args: serde_json::Value,
         _ctx: &ToolCtx,
-    ) -> std::result::Result<String, ToolError> {
+    ) -> std::result::Result<ToolOutput, ToolError> {
         let n = args.get("n").and_then(|n| n.as_i64()).unwrap_or(-1);
         self.gauge
             .executed
@@ -359,7 +360,7 @@ impl Tool for HeldTaskTool {
         }
         .await;
         self.gauge.current.fetch_sub(1, Ordering::SeqCst);
-        Ok(result)
+        Ok(result.into())
     }
 }
 
@@ -396,7 +397,7 @@ impl Tool for FailTool {
         &self,
         _args: serde_json::Value,
         _ctx: &ToolCtx,
-    ) -> std::result::Result<String, ToolError> {
+    ) -> std::result::Result<ToolOutput, ToolError> {
         if self.fatal {
             Err(ToolError::Fatal(Error::Run(self.message.clone())))
         } else {
@@ -431,9 +432,9 @@ impl Tool for SleepTool {
         &self,
         _args: serde_json::Value,
         _ctx: &ToolCtx,
-    ) -> std::result::Result<String, ToolError> {
+    ) -> std::result::Result<ToolOutput, ToolError> {
         tokio::time::sleep(self.duration).await;
-        Ok(self.output.clone())
+        Ok(self.output.clone().into())
     }
 }
 
@@ -464,7 +465,7 @@ impl Tool for LateFailTool {
         &self,
         _args: serde_json::Value,
         _ctx: &ToolCtx,
-    ) -> std::result::Result<String, ToolError> {
+    ) -> std::result::Result<ToolOutput, ToolError> {
         tokio::time::sleep(self.delay).await;
         Err(ToolError::Fatal(Error::Run(self.message.clone())))
     }
@@ -492,13 +493,13 @@ impl Tool for CancelProbeTool {
         &self,
         _args: serde_json::Value,
         ctx: &ToolCtx,
-    ) -> std::result::Result<String, ToolError> {
+    ) -> std::result::Result<ToolOutput, ToolError> {
         tokio::select! {
             _ = ctx.token.cancelled() => {
                 self.flag.store(1, Ordering::SeqCst);
-                Ok("probe cancelled".to_owned())
+                Ok("probe cancelled".to_owned().into())
             }
-            _ = tokio::time::sleep(Duration::from_secs(30)) => Ok("probe timed out".to_owned()),
+            _ = tokio::time::sleep(Duration::from_secs(30)) => Ok("probe timed out".to_owned().into()),
         }
     }
 }
@@ -548,7 +549,7 @@ pub fn recorder() -> (mason::engine::PersistFn, Arc<Mutex<Vec<Message>>>) {
     let saved: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let callback: mason::engine::PersistFn = Arc::new({
         let saved = saved.clone();
-        move |_turn, message| {
+        move |_turn, message, _tokens| {
             let saved = saved.clone();
             Box::pin(async move {
                 saved.lock().expect("unpoisoned").push(message);

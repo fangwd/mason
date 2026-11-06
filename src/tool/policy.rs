@@ -380,7 +380,7 @@ impl Tool for IsolatedFileTool {
     fn read_only(&self) -> bool {
         self.0.read_only()
     }
-    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<String, ToolError> {
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<super::ToolOutput, ToolError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let executable = std::env::current_exe()
             .map_err(|_| ToolError::failure("cannot locate Mason executable"))?;
@@ -459,6 +459,8 @@ impl Tool for IsolatedFileTool {
         }
         let result: Result<String, String> = serde_json::from_slice(&stdout)
             .map_err(|_| ToolError::failure("invalid filesystem sandbox response"))?;
-        result.map_err(ToolError::failure)
+        result
+            .map(super::ToolOutput::from)
+            .map_err(ToolError::failure)
     }
 }

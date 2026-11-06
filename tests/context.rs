@@ -22,6 +22,7 @@ fn call_message(id: &str) -> Message {
         tool_calls: Some(vec![ToolCall::new(id, "bash", "{}")]),
         tool_call_id: None,
         reasoning_content: None,
+        images: Vec::new(),
     }
 }
 
@@ -39,6 +40,7 @@ fn seeded(turns: usize, tokens: usize) -> Vec<Message> {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            images: Vec::new(),
         });
     }
     messages

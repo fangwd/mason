@@ -1,4 +1,4 @@
-//! Stdio MCP fixture exposing echo, failure, and structured-result tools.
+//! Stdio MCP fixture exposing echo, failure, structured-result, and image tools.
 
 use std::sync::Arc;
 
@@ -73,6 +73,11 @@ impl ServerHandler for Fixture {
                     "Returns structured content",
                     object_schema(json!({}), &[]),
                 ),
+                Tool::new(
+                    "screenshot",
+                    "Returns an image",
+                    object_schema(json!({}), &[]),
+                ),
             ]
             .into_iter()
             // a tool that appears once its marker file exists, as after a code change
@@ -115,6 +120,11 @@ impl ServerHandler for Fixture {
                 result.structured_content = Some(json!({"ok": true}));
                 Ok(result.into())
             }
+            "screenshot" => Ok(CallToolResult::success(vec![
+                ContentBlock::text("the page"),
+                ContentBlock::image("aW1n", "image/png"),
+            ])
+            .into()),
             other => Err(ErrorData::internal_error(
                 format!("unknown tool {other}"),
                 None,

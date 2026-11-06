@@ -1829,8 +1829,12 @@ mod build_tests {
                 serde_json::json!({"type": "object", "properties": {}}),
             )
         }
-        async fn call(&self, _: serde_json::Value, _: &ToolCtx) -> Result<String, ToolError> {
-            Ok("native".to_owned())
+        async fn call(
+            &self,
+            _: serde_json::Value,
+            _: &ToolCtx,
+        ) -> Result<crate::tool::ToolOutput, ToolError> {
+            Ok("native".to_owned().into())
         }
     }
 

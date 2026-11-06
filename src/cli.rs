@@ -15,7 +15,7 @@ use crate::agent::Agent;
 use crate::config::{AgentSpec, Manifest};
 use crate::engine::RunEvent;
 use crate::error::Result;
-use crate::llm::ChatDelta;
+use crate::llm::{ChatDelta, Role, Usage};
 use crate::runner::Runner;
 use crate::store::SqliteStore;
 use crate::tool::builtin_tools;
@@ -203,7 +203,11 @@ pub async fn main() -> Result<()> {
                     parent: None,
                 }));
             }
-            let result = tool.call(args, &ctx).await.map_err(|err| err.to_string());
+            let result = tool
+                .call(args, &ctx)
+                .await
+                .map(|output| output.text)
+                .map_err(|err| err.to_string());
             emit(&serde_json::to_string(&result).expect("tool result serialization"));
             Ok(())
         }
@@ -399,6 +403,19 @@ pub async fn run_to_stdout(agent: &Agent, profile: &str, prompt: &str) -> Result
         let mut expected_seq = 0u32;
         let mut contiguous = true;
         let mut printed = String::new();
+        let mut total = Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+        };
+        let mut requests = 0u32;
+        // Whether streamed text left the terminal mid-line, so a status line starts
+        // on its own line.
+        let mut mid_line = false;
+        let end_line = |mid_line: &mut bool| {
+            if std::mem::take(mid_line) {
+                eprintln!();
+            }
+        };
         while let Some(event) = rx.recv().await {
             match event {
                 RunEvent::Delta {
@@ -412,9 +429,12 @@ pub async fn run_to_stdout(agent: &Agent, profile: &str, prompt: &str) -> Result
                     }
                     if contiguous && seq == expected_seq {
                         expected_seq = seq + 1;
-                        if let ChatDelta::Text(text) = &delta {
+                        if let ChatDelta::Text(text) = &delta
+                            && !text.is_empty()
+                        {
                             emit(text);
                             printed.push_str(text);
+                            mid_line = !text.ends_with('\n');
                         }
                     } else {
                         contiguous = false;
@@ -423,12 +443,35 @@ pub async fn run_to_stdout(agent: &Agent, profile: &str, prompt: &str) -> Result
                 RunEvent::ToolStarted {
                     name, arguments, ..
                 } => {
+                    end_line(&mut mid_line);
                     eprintln!("> {name} {}", clip(&arguments, 300));
                 }
-                _ => {}
+                RunEvent::Committed {
+                    message, tokens, ..
+                } => {
+                    let line = match (message.role, tokens.usage) {
+                        (Role::Assistant, Some(usage)) => {
+                            requests += 1;
+                            total.prompt_tokens += usage.prompt_tokens;
+                            total.completion_tokens += usage.completion_tokens;
+                            format!(
+                                "  [model] {} prompt + {} completion tokens",
+                                usage.prompt_tokens, usage.completion_tokens
+                            )
+                        }
+                        (Role::Assistant, None) => format!(
+                            "  [model] no usage reported; reply ~{} tokens",
+                            tokens.estimated
+                        ),
+                        (Role::Tool, _) => format!("  [result] ~{} tokens", tokens.estimated),
+                        _ => continue,
+                    };
+                    end_line(&mut mid_line);
+                    eprintln!("{line}");
+                }
             }
         }
-        printed
+        (printed, total, requests)
     });
     // Cancellation lets tools clean up before the event queue closes.
     let token = tokio_util::sync::CancellationToken::new();
@@ -442,7 +485,7 @@ pub async fn run_to_stdout(agent: &Agent, profile: &str, prompt: &str) -> Result
         }
     };
     let interrupted = token.is_cancelled();
-    let printed = printer.await.expect("the printer task cannot panic");
+    let (printed, total, requests) = printer.await.expect("the printer task cannot panic");
     let answer = outcome.answer.as_str();
     // Append any answer suffix lost by the observer queue.
     if let Some(rest) = answer.strip_prefix(&printed) {
@@ -456,6 +499,12 @@ pub async fn run_to_stdout(agent: &Agent, profile: &str, prompt: &str) -> Result
     }
     if !answer.is_empty() && !answer.ends_with('\n') {
         emit("\n");
+    }
+    if requests > 0 {
+        eprintln!(
+            "[tokens] {} prompt + {} completion across {requests} model requests",
+            total.prompt_tokens, total.completion_tokens
+        );
     }
     if !interrupted {
         review_run(agent, &outcome.messages).await;

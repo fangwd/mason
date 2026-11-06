@@ -25,7 +25,7 @@ mod sse;
 
 pub use error::{LlmError, is_context_overflow};
 pub use message::{
-    ChatDelta, ChatRequest, ChatTurn, FunctionCall, Message, Role, ToolCall, ToolSpec,
+    ChatDelta, ChatRequest, ChatTurn, FunctionCall, Image, Message, Role, ToolCall, ToolSpec,
     TurnAccumulator, Usage,
 };
 pub use tokio_util::sync::CancellationToken;
@@ -91,6 +91,9 @@ pub struct Vendor {
     /// `false` (`AI_<NAME>_STREAM=false`) falls back to single-shot
     /// responses adapted into the same delta stream.
     pub stream: bool,
+    /// `false` (`AI_<NAME>_IMAGES=false`) leaves tool images out of requests,
+    /// for models without image input.
+    pub images: bool,
 }
 
 /// The configured vendors, in failover order.
@@ -171,6 +174,7 @@ impl Vendors {
                 _ => DEFAULT_CONTEXT_TOKENS,
             };
             let stream = optional_bool(&get, &prefix, "STREAM")?.unwrap_or(true);
+            let images = optional_bool(&get, &prefix, "IMAGES")?.unwrap_or(true);
             let extra_body = json_object(&get, &prefix, "EXTRA_BODY")?;
             if let Some(reserved) = extra_body
                 .keys()
@@ -203,6 +207,7 @@ impl Vendors {
                 extra_body,
                 headers,
                 stream,
+                images,
             });
         }
         Ok(Self(vendors))
@@ -266,6 +271,12 @@ pub trait ChatModel: Send + Sync {
     /// The context capacity in tokens that memory management plans against.
     fn context_tokens(&self) -> usize;
 
+    /// Whether requests may carry images; otherwise the engine leaves them out
+    /// and they do not count toward the context.
+    fn accepts_images(&self) -> bool {
+        true
+    }
+
     /// Runs one model turn. The returned stream owns a clone of `token` and
     /// retains its deadlines after this call returns; cancelling or dropping
     /// the stream closes the underlying response body.
@@ -319,6 +330,10 @@ impl ChatModel for VendorModel {
             .map(|vendor| vendor.context_tokens)
             .min()
             .unwrap_or(0)
+    }
+
+    fn accepts_images(&self) -> bool {
+        self.vendors.iter().any(|vendor| vendor.images)
     }
 
     async fn stream(&self, request: ChatRequest, token: &CancellationToken) -> Result<ChatStream> {
@@ -928,6 +943,7 @@ mod tests {
                     extra_body: Default::default(),
                     headers: Default::default(),
                     stream: stream_mode,
+                    images: true,
                 })
                 .collect(),
         )
@@ -1825,6 +1841,7 @@ mod tests {
             ("AI_DEEPSEEK_EXTRA_BODY", r#"{"enable_thinking": true}"#),
             ("AI_DEEPSEEK_HEADERS", r#"{"api-key": "secret-header"}"#),
             ("AI_DEEPSEEK_STREAM", "false"),
+            ("AI_DEEPSEEK_IMAGES", "false"),
         ]
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
@@ -1840,6 +1857,7 @@ mod tests {
         );
         assert_eq!(openai.context_tokens, 128_000, "the default context");
         assert!(openai.stream, "streaming is the default");
+        assert!(openai.images, "images are sent by default");
         assert_eq!(openai.api_key.as_deref(), Some("sk-1"));
         assert!(openai.extra_body.is_empty() && openai.headers.is_empty());
 
@@ -1856,6 +1874,7 @@ mod tests {
             !deepseek.stream,
             "AI_<NAME>_STREAM=false falls back to single-shot"
         );
+        assert!(!deepseek.images, "AI_<NAME>_IMAGES=false leaves images out");
 
         assert_eq!(
             vendors.context_tokens(),

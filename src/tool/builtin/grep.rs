@@ -212,7 +212,10 @@ mod tests {
     }
 
     async fn grep(ctx: &ToolCtx, args: serde_json::Value) -> Result<String, ToolError> {
-        Typed(GrepTool).call(args, ctx).await
+        Typed(GrepTool)
+            .call(args, ctx)
+            .await
+            .map(|output| output.text)
     }
 
     #[tokio::test]

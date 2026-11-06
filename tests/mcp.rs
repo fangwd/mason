@@ -192,7 +192,7 @@ fn fixture_path() -> String {
 }
 
 async fn call(tool: &Arc<dyn Tool>, args: Value) -> Result<String, mason::ToolError> {
-    tool.call(args, &ctx()).await
+    tool.call(args, &ctx()).await.map(|output| output.text)
 }
 
 #[tokio::test]
@@ -214,11 +214,16 @@ async fn tools_of_a_local_stdio_server_become_agent_tools() {
         .collect();
     assert_eq!(
         names,
-        ["my_files_echo", "my_files_fail", "my_files_structured"]
+        [
+            "my_files_echo",
+            "my_files_fail",
+            "my_files_structured",
+            "my_files_screenshot"
+        ]
     );
 
-    let [echo, fail, structured] = &connection.tools()[..3] else {
-        panic!("three tools")
+    let [echo, fail, structured, screenshot] = &connection.tools()[..4] else {
+        panic!("four tools")
     };
 
     // The advertised schema matches the old argument contract.
@@ -244,6 +249,15 @@ async fn tools_of_a_local_stdio_server_become_agent_tools() {
     let err = call(fail, json!({})).await.unwrap_err();
     assert!(err.to_string().contains("it broke"), "{err}");
     assert_eq!(call(structured, json!({})).await.unwrap(), "{\"ok\":true}");
+    let shot = screenshot.call(json!({}), &ctx()).await.unwrap();
+    assert_eq!(shot.text, "the page\n\n[image image/png attached]");
+    assert_eq!(
+        shot.images,
+        [mason::llm::Image {
+            mime_type: "image/png".into(),
+            data: "aW1n".into(),
+        }]
+    );
 
     connection.close().await;
 }
@@ -299,7 +313,7 @@ async fn a_crashed_local_server_is_restarted_on_the_next_call() {
         .find(|tool| tool.spec().function.name == "fixture_echo")
         .unwrap();
     let scope = ctx();
-    let first = tool.call(json!({"text":"pid"}), &scope).await.unwrap();
+    let first = tool.call(json!({"text":"pid"}), &scope).await.unwrap().text;
     std::process::Command::new("kill")
         .args(["-9", &first])
         .status()
@@ -309,7 +323,7 @@ async fn a_crashed_local_server_is_restarted_on_the_next_call() {
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if let Ok(pid) = tool.call(json!({"text":"pid"}), &scope).await {
-            second = pid;
+            second = pid.text;
             break;
         }
     }

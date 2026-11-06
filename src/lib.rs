@@ -29,7 +29,7 @@ pub mod tool;
 
 pub use agent::{Agent, AgentBuilder, SessionRun};
 pub use config::{AgentSpec, Manifest};
-pub use engine::{Limits, RunConfig, RunEvent, RunOutcome};
+pub use engine::{Limits, MessageTokens, RunConfig, RunEvent, RunOutcome};
 pub use error::{Error, Result};
 pub use llm::{
     CancellationToken, ChatDelta, ChatModel, ChatRequest, ChatStream, ChatTurn, LlmError, Message,
@@ -46,5 +46,6 @@ pub use store::{
     StoredInput,
 };
 pub use tool::{
-    Keep, OutputSpill, Tool, ToolCtx, ToolError, Toolset, Typed, TypedTool, builtin_tools,
+    Keep, OutputSpill, Tool, ToolCtx, ToolError, ToolOutput, Toolset, Typed, TypedTool,
+    builtin_tools,
 };

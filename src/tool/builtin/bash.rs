@@ -265,7 +265,10 @@ mod tests {
     }
 
     async fn bash(ctx: &ToolCtx, args: serde_json::Value) -> Result<String, ToolError> {
-        Typed(BashTool).call(args, ctx).await
+        Typed(BashTool)
+            .call(args, ctx)
+            .await
+            .map(|output| output.text)
     }
 
     #[tokio::test]

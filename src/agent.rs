@@ -799,7 +799,7 @@ async fn run_saved(
     let persist: PersistFn = Arc::new({
         let store = store.clone();
         let run_id = run_id.to_owned();
-        move |turn, message| {
+        move |turn, message, tokens| {
             let store = store.clone();
             let run_id = run_id.clone();
             Box::pin(async move {
@@ -808,7 +808,7 @@ async fn run_saved(
                         session_id,
                         &run_id,
                         "message",
-                        json!({ "message": message, "turn": turn }),
+                        json!({ "message": message, "turn": turn, "tokens": tokens }),
                     )
                     .await
                     .map(|_| ())
@@ -1724,8 +1724,8 @@ mod tests {
                 &self,
                 _args: serde_json::Value,
                 _ctx: &ToolCtx,
-            ) -> std::result::Result<String, crate::tool::ToolError> {
-                Ok(String::new())
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::tool::ToolError> {
+                Ok(crate::tool::ToolOutput::default())
             }
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1787,8 +1787,8 @@ mod tests {
             &self,
             _args: serde_json::Value,
             _ctx: &ToolCtx,
-        ) -> std::result::Result<String, crate::tool::ToolError> {
-            Ok(String::new())
+        ) -> std::result::Result<crate::tool::ToolOutput, crate::tool::ToolError> {
+            Ok(crate::tool::ToolOutput::default())
         }
     }
 

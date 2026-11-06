@@ -206,7 +206,7 @@ async fn filesystem_search_leaves_the_runtime_responsive() {
         "the search finished before another runtime task could run"
     );
     let output = searching.await.unwrap().unwrap();
-    assert!(output.starts_with("big.txt:1:"));
+    assert!(output.text.starts_with("big.txt:1:"));
 }
 
 #[tokio::test]
@@ -367,7 +367,7 @@ async fn mcp_keeps_the_servers_dictionary_and_pattern_schemas() {
             .call(json!({"arbitrary": "valid"}), &ToolCtx::new("."))
             .await
             .unwrap();
-        assert!(result.contains("valid"));
+        assert!(result.text.contains("valid"));
         connection.close().await;
         server.abort();
     }

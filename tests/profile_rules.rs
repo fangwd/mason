@@ -3,7 +3,7 @@ mod support;
 
 use mason::profile::ProfilePatch;
 use mason::store::{NewInput, NewSession, SessionStore, SqliteStore};
-use mason::{Agent, OutputSpill, Tool, ToolCtx, ToolError, ToolSpec, builtin_tools};
+use mason::{Agent, OutputSpill, Tool, ToolCtx, ToolError, ToolOutput, ToolSpec, builtin_tools};
 use serde_json::{Value, json};
 use std::sync::{
     Arc,
@@ -110,12 +110,12 @@ impl Tool for CheckFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec::function("check", "check edited file", json!({"type":"object"}))
     }
-    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<String, ToolError> {
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         self.0.fetch_add(1, Ordering::SeqCst);
         let contents = std::fs::read_to_string(ctx.cwd.join(args["path"].as_str().unwrap()))
             .unwrap_or_default();
         if contents == "ok" {
-            Ok("ok".into())
+            Ok("ok".to_owned().into())
         } else {
             Err(ToolError::failure("broken file"))
         }

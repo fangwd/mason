@@ -216,7 +216,10 @@ mod tests {
 
     async fn read(dir: &std::path::Path, args: serde_json::Value) -> Result<String, ToolError> {
         let ctx = ToolCtx::new(dir).with_spill(Arc::new(OutputSpill::new(dir.join("spill"))));
-        Typed(ReadTool).call(args, &ctx).await
+        Typed(ReadTool)
+            .call(args, &ctx)
+            .await
+            .map(|output| output.text)
     }
 
     #[tokio::test]

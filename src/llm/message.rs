@@ -77,6 +77,26 @@ pub struct Message {
     /// Thinking models expect their reasoning back on their own messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Images a tool returned. OpenAI tool messages carry text only, so requests
+    /// send them in a user message after the tool results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<Image>,
+}
+
+/// The note a tool result gets when its images are left out of a request.
+pub const IMAGES_NOT_SENT: &str = "[Images not sent: this model does not accept images]";
+
+/// A base64-encoded image.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Image {
+    pub mime_type: String,
+    pub data: String,
+}
+
+impl Image {
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.mime_type, self.data)
+    }
 }
 
 impl Message {
@@ -103,6 +123,7 @@ impl Message {
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
+            images: Vec::new(),
         }
     }
 }
@@ -379,6 +400,7 @@ impl TurnAccumulator {
             tool_calls,
             tool_call_id: None,
             reasoning_content: (!self.reasoning.is_empty()).then_some(self.reasoning),
+            images: Vec::new(),
         };
         Ok(ChatTurn {
             message,
@@ -436,6 +458,7 @@ mod tests {
             tool_calls: Some(vec![ToolCall::new("c1", "read", "{\"path\":\"a\"}")]),
             tool_call_id: None,
             reasoning_content: Some("thinking".into()),
+            images: Vec::new(),
         };
         assert_eq!(
             serde_json::to_value(&assistant).unwrap(),

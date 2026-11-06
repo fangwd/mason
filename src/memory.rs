@@ -13,7 +13,7 @@ use crate::Error;
 use crate::error::Result;
 use crate::llm::ToolSpec;
 use crate::skill::split_frontmatter;
-use crate::tool::{Tool, ToolCtx, ToolError};
+use crate::tool::{Tool, ToolCtx, ToolError, ToolOutput};
 
 pub const MAX_MEMORIES: usize = 200;
 pub const MAX_BODY_BYTES: usize = 4096;
@@ -662,7 +662,11 @@ impl Tool for MemoryTool {
         self.spec.clone()
     }
 
-    async fn call(&self, args: Value, _ctx: &ToolCtx) -> std::result::Result<String, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        _ctx: &ToolCtx,
+    ) -> std::result::Result<ToolOutput, ToolError> {
         let args: Args = serde_json::from_value(args)
             .map_err(|err| ToolError::failure(format!("invalid arguments: {err}")))?;
         if self.read_only && !matches!(args.command, Command::View) {
@@ -690,7 +694,7 @@ impl Tool for MemoryTool {
             }
             Command::Delete => self.delete(required(args.name, "name")?).await,
         };
-        result.map_err(ToolError::Failure)
+        result.map(ToolOutput::from).map_err(ToolError::Failure)
     }
 }
 
@@ -709,6 +713,7 @@ mod tests {
     async fn call(tool: &MemoryTool, args: Value) -> std::result::Result<String, String> {
         tool.call(args, &ToolCtx::new("."))
             .await
+            .map(|output| output.text)
             .map_err(|err| err.to_string())
     }
 

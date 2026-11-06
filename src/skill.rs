@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use crate::llm::ToolSpec;
-use crate::tool::{Tool, ToolCtx, ToolError};
+use crate::tool::{Tool, ToolCtx, ToolError, ToolOutput};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Skill {
@@ -166,7 +166,7 @@ impl Tool for SkillTool {
         &self,
         args: serde_json::Value,
         _ctx: &ToolCtx,
-    ) -> std::result::Result<String, ToolError> {
+    ) -> std::result::Result<ToolOutput, ToolError> {
         let Some(name) = args.get("name").and_then(|value| value.as_str()) else {
             return Err(ToolError::failure(
                 "invalid arguments: missing field `name`",
@@ -208,7 +208,7 @@ impl Tool for SkillTool {
             out.push_str("\n</skill_files>");
         }
         out.push_str("\n</skill_content>");
-        Ok(out)
+        Ok(out.into())
     }
 }
 
@@ -392,7 +392,8 @@ mod tests {
         let out = tool
             .call(serde_json::json!({"name": "deploy"}), &ctx)
             .await
-            .unwrap();
+            .unwrap()
+            .text;
         assert!(
             out.starts_with("<skill_content name=\"deploy\">\n# Skill: deploy\n\nSteps here.\n"),
             "{out}"

@@ -779,6 +779,11 @@ async fn deltas_are_transient_and_committed_messages_carry_cursors() {
             .and_then(Value::as_str),
         Some("streamed answer")
     );
+    assert_eq!(
+        committed.json().pointer("/data/tokens/estimated"),
+        Some(&json!(4)),
+        "the stored message logs its estimated tokens"
+    );
 }
 
 #[tokio::test]

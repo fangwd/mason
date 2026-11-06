@@ -29,9 +29,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::error::Error;
-use crate::llm::ToolSpec;
+use crate::llm::{Image, ToolSpec};
 use crate::tool::process::GroupGuard;
-use crate::tool::{Tool, ToolCtx, ToolError};
+use crate::tool::{Tool, ToolCtx, ToolError, ToolOutput};
 
 /// Default per-server connect and discovery timeout.
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -596,7 +596,7 @@ impl Tool for ScopedMcpTool {
     fn mcp_server(&self) -> Option<&str> {
         Some(&self.server)
     }
-    async fn call(&self, args: Value, ctx: &ToolCtx) -> std::result::Result<String, ToolError> {
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> std::result::Result<ToolOutput, ToolError> {
         let connection = scoped_connection(&ctx.scope(), &self.server);
         // The lock only covers connecting; calls to one server run concurrently.
         let tool = {
@@ -682,7 +682,7 @@ impl Tool for McpTool {
         self.read_only
     }
 
-    async fn call(&self, args: Value, ctx: &ToolCtx) -> std::result::Result<String, ToolError> {
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> std::result::Result<ToolOutput, ToolError> {
         // Validate arguments against the advertised schema before sending them.
         if let Some(problem) = check_args(&self.spec.function.parameters, &args) {
             return Err(ToolError::failure(format!(
@@ -736,8 +736,9 @@ impl Tool for McpTool {
                 "the MCP server sent an unexpected response",
             ));
         };
-        let text = flatten(&result.content);
-        if result.is_error.unwrap_or(false) {
+        let failed = result.is_error.unwrap_or(false);
+        let (text, images) = flatten(&result.content, !failed);
+        if failed {
             return Err(ToolError::failure(if text.is_empty() {
                 "The MCP tool returned an error".to_owned()
             } else {
@@ -745,18 +746,21 @@ impl Tool for McpTool {
             }));
         }
         if !text.is_empty() {
-            return Ok(text);
+            return Ok(ToolOutput { text, images });
         }
         Ok(match &result.structured_content {
             Some(structured) => structured.to_string(),
             None => "(no output)".to_owned(),
-        })
+        }
+        .into())
     }
 }
 
-/// Flattens content blocks to model-visible text.
-fn flatten(content: &[ContentBlock]) -> String {
-    content
+/// Flattens content blocks to model-visible text, keeping images aside with a
+/// marker in their place, or marking them omitted.
+fn flatten(content: &[ContentBlock], keep_images: bool) -> (String, Vec<Image>) {
+    let mut images = Vec::new();
+    let text = content
         .iter()
         .map(|block| match block {
             ContentBlock::Text(text) => text.text.to_string(),
@@ -773,13 +777,21 @@ fn flatten(content: &[ContentBlock]) -> String {
                 }
                 _ => "[resource content omitted]".to_owned(),
             },
+            ContentBlock::Image(image) if keep_images => {
+                images.push(Image {
+                    mime_type: image.mime_type.clone(),
+                    data: image.data.clone(),
+                });
+                format!("[image {} attached]", image.mime_type)
+            }
             ContentBlock::Image(image) => format!("[image {} content omitted]", image.mime_type),
             ContentBlock::Audio(audio) => format!("[audio {} content omitted]", audio.mime_type),
             ContentBlock::ResourceLink(_) => "[resource_link content omitted]".to_owned(),
             _ => "[content omitted]".to_owned(),
         })
         .collect::<Vec<_>>()
-        .join("\n\n")
+        .join("\n\n");
+    (text, images)
 }
 
 /// Checks required fields, closed-schema unknown fields, and simple argument types.
@@ -838,6 +850,20 @@ fn json_type(value: &Value) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn failed_results_mark_their_images_omitted() {
+        let content = [
+            ContentBlock::text("it broke"),
+            ContentBlock::image("aW1n", "image/png"),
+        ];
+        let (text, images) = flatten(&content, false);
+        assert_eq!(text, "it broke\n\n[image image/png content omitted]");
+        assert!(images.is_empty());
+        let (text, images) = flatten(&content, true);
+        assert_eq!(text, "it broke\n\n[image image/png attached]");
+        assert_eq!(images.len(), 1);
+    }
 
     #[test]
     fn refresh_skips_namespaces_the_profile_cannot_use() {

@@ -13,9 +13,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::Error;
 use crate::error::Result;
-use crate::llm::ToolSpec;
+use crate::llm::{Image, ToolSpec};
 
 pub mod builtin;
+pub mod image;
 pub mod output;
 pub mod policy;
 pub mod process;
@@ -218,6 +219,22 @@ impl ToolCtx {
     }
 }
 
+/// A tool's result: text for the model, plus any images it returned.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ToolOutput {
+    pub text: String,
+    pub images: Vec<Image>,
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
 /// The object-safe tool interface the engine calls.
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
@@ -227,7 +244,7 @@ pub trait Tool: Send + Sync {
 
     /// Runs one call with raw JSON arguments. Implementations validate;
     /// [`Typed`] does it through serde.
-    async fn call(&self, args: Value, ctx: &ToolCtx) -> std::result::Result<String, ToolError>;
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> std::result::Result<ToolOutput, ToolError>;
 
     /// Whether the tool only reads: a `read_only` profile's globs admit no other.
     fn read_only(&self) -> bool {
@@ -275,10 +292,10 @@ impl<T: TypedTool> Tool for Typed<T> {
         ToolSpec::function(self.0.name(), self.0.description(), parameters)
     }
 
-    async fn call(&self, args: Value, ctx: &ToolCtx) -> std::result::Result<String, ToolError> {
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> std::result::Result<ToolOutput, ToolError> {
         let args = serde_json::from_value::<T::Args>(args)
             .map_err(|err| ToolError::Failure(format!("invalid arguments: {err}")))?;
-        self.0.run(args, ctx).await
+        self.0.run(args, ctx).await.map(ToolOutput::from)
     }
 
     fn read_only(&self) -> bool {
@@ -457,7 +474,7 @@ mod tests {
             .call(serde_json::json!({"message": "ab", "times": 2}), &ctx())
             .await
             .unwrap();
-        assert_eq!(out, "abab");
+        assert_eq!(out.text, "abab");
 
         let err = tool.call(serde_json::json!({}), &ctx()).await.unwrap_err();
         assert!(err.to_string().contains("missing field `message`"), "{err}");

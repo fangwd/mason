@@ -20,6 +20,7 @@ Vendor names use letters, digits and `_`. Optional per-vendor settings:
 | `AI_<NAME>_API_KEY` | May be omitted for servers without authentication (vLLM, Ollama); no `Authorization` header is sent then. |
 | `AI_<NAME>_CONTEXT_TOKENS` | Context capacity (default 128000). |
 | `AI_<NAME>_STREAM` | Streaming on/off (default true). |
+| `AI_<NAME>_IMAGES` | Send tool images such as screenshots (default true); set `false` for models without image input. |
 | `AI_<NAME>_EXTRA_BODY` | JSON object merged into every request, e.g. `{"max_tokens": 32000, "temperature": 0.2}` or `{"enable_thinking": true}`. |
 | `AI_<NAME>_HEADERS` | JSON object of extra headers, e.g. Azure's `{"api-key": "..."}` or OpenRouter's `{"HTTP-Referer": "..."}`. |
 

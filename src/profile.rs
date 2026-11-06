@@ -13,7 +13,7 @@ use crate::error::Result;
 use crate::llm::ToolSpec;
 use crate::prompt::PromptSet;
 use crate::store::Session;
-use crate::tool::{Tool as ToolTrait, ToolCtx, ToolError, Toolset};
+use crate::tool::{Tool as ToolTrait, ToolCtx, ToolError, ToolOutput, Toolset};
 
 /// What an agent may do.
 #[derive(Debug, Clone, PartialEq)]
@@ -726,7 +726,7 @@ impl ToolTrait for TaskTool {
         &self,
         args: serde_json::Value,
         ctx: &ToolCtx,
-    ) -> std::result::Result<String, ToolError> {
+    ) -> std::result::Result<ToolOutput, ToolError> {
         let text = |key: &str| {
             args.get(key)
                 .and_then(|value| value.as_str())
@@ -773,7 +773,8 @@ impl ToolTrait for TaskTool {
                 "<task agent=\"{}\">\n<task_result>\n{}\n</task_result>\n</task>",
                 profile.name, result.answer
             ),
-        })
+        }
+        .into())
     }
 }
 
@@ -1123,7 +1124,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            out,
+            out.text,
             "<task session=\"7\" agent=\"general\">\n<task_result>\ndid: p\n</task_result>\n</task>"
         );
         assert_eq!(*launched.lock().unwrap(), ["general"]);

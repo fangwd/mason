@@ -1,5 +1,6 @@
 //! OpenAI-compatible request encoding, response decoding, and HTTP transport.
 
+use std::borrow::Cow;
 use std::pin::Pin;
 use std::result::Result as StdResult;
 
@@ -13,7 +14,7 @@ use crate::Error;
 use crate::error::Result;
 use crate::llm::Vendor;
 use crate::llm::error::{LlmError, retry_after_ms};
-use crate::llm::message::{ChatDelta, ChatRequest, Message, ToolSpec};
+use crate::llm::message::{ChatDelta, ChatRequest, IMAGES_NOT_SENT, Message, Role, ToolSpec};
 
 /// A response body as a byte stream, normalized to [`LlmError`].
 pub(crate) type BodyStream = Pin<Box<dyn Stream<Item = StdResult<Bytes, LlmError>> + Send>>;
@@ -97,7 +98,7 @@ pub(crate) fn request_body(vendor: &Vendor, request: &ChatRequest) -> Result<Vec
     #[derive(Serialize)]
     struct WireRequest<'a> {
         model: &'a str,
-        messages: &'a [Message],
+        messages: Vec<RequestMessage<'a>>,
         #[serde(skip_serializing_if = "<[_]>::is_empty")]
         tools: &'a [ToolSpec],
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -107,7 +108,7 @@ pub(crate) fn request_body(vendor: &Vendor, request: &ChatRequest) -> Result<Vec
     }
     let wire = WireRequest {
         model: &vendor.model,
-        messages: &request.messages,
+        messages: wire_messages(&request.messages, vendor.images),
         tools: &request.tools,
         stream: vendor.stream.then_some(true),
         stream_options: vendor.stream.then_some(StreamOptions {
@@ -124,6 +125,95 @@ pub(crate) fn request_body(vendor: &Vendor, request: &ChatRequest) -> Result<Vec
         fields.extend(vendor.extra_body.clone());
     }
     serde_json::to_vec(&body).map_err(serialize_error)
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum RequestMessage<'a> {
+    Message(Cow<'a, Message>),
+    Parts {
+        role: Role,
+        content: Vec<RequestPart>,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RequestPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Serialize)]
+struct ImageUrl {
+    url: String,
+}
+
+/// Tool messages carry text only, so the images of a run of tool results follow
+/// them in one user message; a vendor without image input gets a note instead.
+fn wire_messages(messages: &[Message], images: bool) -> Vec<RequestMessage<'_>> {
+    fn flush<'a>(wire: &mut Vec<RequestMessage<'a>>, parts: &mut Vec<RequestPart>) {
+        if !parts.is_empty() {
+            wire.push(RequestMessage::Parts {
+                role: Role::User,
+                content: std::mem::take(parts),
+            });
+        }
+    }
+    let mut wire = Vec::with_capacity(messages.len());
+    let mut parts = Vec::new();
+    for message in messages {
+        // Strict chat templates reject two user turns in a row.
+        if message.role == Role::User && !parts.is_empty() {
+            let mut content = std::mem::take(&mut parts);
+            content.extend(
+                message
+                    .content
+                    .clone()
+                    .map(|text| RequestPart::Text { text }),
+            );
+            wire.push(RequestMessage::Parts {
+                role: Role::User,
+                content,
+            });
+            continue;
+        }
+        if message.role != Role::Tool {
+            flush(&mut wire, &mut parts);
+        }
+        if message.images.is_empty() {
+            wire.push(RequestMessage::Message(Cow::Borrowed(message)));
+            continue;
+        }
+        let mut content = message.content.clone();
+        if images {
+            parts.push(RequestPart::Text {
+                text: format!(
+                    "Images returned by tool call {}:",
+                    message.tool_call_id.as_deref().unwrap_or_default()
+                ),
+            });
+            parts.extend(message.images.iter().map(|image| RequestPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: image.data_url(),
+                },
+            }));
+        } else {
+            content
+                .get_or_insert_default()
+                .push_str(&format!("\n{IMAGES_NOT_SENT}"));
+        }
+        wire.push(RequestMessage::Message(Cow::Owned(Message {
+            role: message.role,
+            content,
+            tool_calls: message.tool_calls.clone(),
+            tool_call_id: message.tool_call_id.clone(),
+            reasoning_content: message.reasoning_content.clone(),
+            images: Vec::new(),
+        })));
+    }
+    flush(&mut wire, &mut parts);
+    wire
 }
 
 /// Reads bounded error text under the turn's cancellation and deadline.
@@ -469,6 +559,7 @@ mod tests {
             extra_body: Default::default(),
             headers: Default::default(),
             stream,
+            images: true,
         }
     }
 
@@ -495,6 +586,82 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"], json!({"include_usage": true}));
         assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn tool_images_follow_their_tool_results_in_one_user_turn() {
+        let image = crate::llm::Image {
+            mime_type: "image/png".into(),
+            data: "aW1n".into(),
+        };
+        let request = ChatRequest {
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: None,
+                    tool_calls: Some(vec![
+                        ToolCall::new("c1", "shot", "{}"),
+                        ToolCall::new("c2", "echo", "{}"),
+                    ]),
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    images: Vec::new(),
+                },
+                Message {
+                    images: vec![image],
+                    ..Message::tool("c1", "[image image/png attached]")
+                },
+                Message::tool("c2", "hi"),
+                Message::user("next"),
+            ],
+            tools: vec![],
+        };
+        let body: serde_json::Value =
+            serde_json::from_slice(&request_body(&vendor(true), &request).unwrap()).unwrap();
+        assert_eq!(
+            body["messages"],
+            json!([
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "shot", "arguments": "{}"}},
+                    {"id": "c2", "type": "function", "function": {"name": "echo", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "content": "[image image/png attached]", "tool_call_id": "c1"},
+                {"role": "tool", "content": "hi", "tool_call_id": "c2"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Images returned by tool call c1:"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1n"}},
+                    {"type": "text", "text": "next"}
+                ]}
+            ])
+        );
+    }
+
+    #[test]
+    fn vendors_without_image_input_get_a_note_instead_of_images() {
+        let request = ChatRequest {
+            messages: vec![Message {
+                images: vec![crate::llm::Image {
+                    mime_type: "image/png".into(),
+                    data: "aW1n".into(),
+                }],
+                ..Message::tool("c1", "[image image/png attached]")
+            }],
+            tools: vec![],
+        };
+        let text_only = Vendor {
+            images: false,
+            ..vendor(true)
+        };
+        let body: serde_json::Value =
+            serde_json::from_slice(&request_body(&text_only, &request).unwrap()).unwrap();
+        assert_eq!(
+            body["messages"],
+            json!([{
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": "[image image/png attached]\n[Images not sent: this model does not accept images]"
+            }])
+        );
     }
 
     #[test]

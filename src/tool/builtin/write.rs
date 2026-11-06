@@ -202,7 +202,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            out,
+            out.text,
             format!("Wrote {}", dir.path().join("a/b/c.txt").display())
         );
         assert_eq!(

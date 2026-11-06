@@ -407,7 +407,7 @@ async fn bounds_fan_out_and_saves_fast_results_while_a_slow_sibling_is_pending()
     let persist: PersistFn = Arc::new({
         let saved = saved.clone();
         let fast_saved = fast_saved.clone();
-        move |_turn, message| {
+        move |_turn, message, _tokens| {
             let saved = saved.clone();
             let fast_saved = fast_saved.clone();
             Box::pin(async move {
@@ -791,7 +791,7 @@ async fn required_persistence_failure_stops_the_run() {
         dir.path(),
     )
     .await;
-    config.persist = Some(Arc::new(|_turn, _message| {
+    config.persist = Some(Arc::new(|_turn, _message, _tokens| {
         Box::pin(async { Err(Error::Run("store down".to_owned())) })
     }));
     let err = engine::run(config).await.unwrap_err();
@@ -952,7 +952,7 @@ async fn persistence_keeps_conversation_order_under_a_slow_callback() {
     let recorded: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     config.persist = Some(Arc::new({
         let recorded = recorded.clone();
-        move |_turn: u32, message: Message| {
+        move |_turn: u32, message: Message, _tokens| {
             let recorded = recorded.clone();
             Box::pin(async move {
                 // The first result to complete persists slowly: without the
@@ -1048,7 +1048,7 @@ async fn a_hung_persist_callback_cannot_outlive_the_run_deadline() {
     )
     .await;
     config.limits.timeout = Duration::from_millis(300);
-    config.persist = Some(Arc::new(|_turn, _message| {
+    config.persist = Some(Arc::new(|_turn, _message, _tokens| {
         Box::pin(async move { std::future::pending::<mason::Result<()>>().await })
     }));
     let started = tokio::time::Instant::now();
@@ -1100,11 +1100,11 @@ impl mason::Tool for CheckTool {
         &self,
         args: serde_json::Value,
         ctx: &mason::ToolCtx,
-    ) -> std::result::Result<String, mason::ToolError> {
+    ) -> std::result::Result<mason::ToolOutput, mason::ToolError> {
         let path = args["path"].as_str().unwrap_or_default();
         let text = std::fs::read_to_string(ctx.cwd.join(path)).unwrap_or_default();
         if text.contains("ok") {
-            Ok(format!("{path} is ok"))
+            Ok(format!("{path} is ok").into())
         } else {
             Err(mason::ToolError::Failure(format!("{path} is broken")))
         }
@@ -1540,7 +1540,7 @@ impl mason::Tool for CleaningCheck {
         &self,
         _args: serde_json::Value,
         ctx: &mason::ToolCtx,
-    ) -> std::result::Result<String, mason::ToolError> {
+    ) -> std::result::Result<mason::ToolOutput, mason::ToolError> {
         ctx.token.cancelled().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         self.0.store(true, Ordering::SeqCst);
@@ -1688,4 +1688,246 @@ async fn a_finish_check_takes_the_one_tool_slot_without_deadlock() {
     config.rules = Some(Arc::new(rules(None, None)));
     let outcome = tokio::time::timeout(Duration::from_secs(10), engine::run(config)).await;
     assert_eq!(outcome.expect("no deadlock").unwrap().answer, "done");
+}
+
+/// A 1x1 PNG.
+const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+struct ShotTool;
+
+#[async_trait::async_trait]
+impl mason::Tool for ShotTool {
+    fn spec(&self) -> mason::ToolSpec {
+        mason::ToolSpec::function("shot", "screenshot", serde_json::json!({"type": "object"}))
+    }
+    async fn call(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &mason::ToolCtx,
+    ) -> std::result::Result<mason::ToolOutput, mason::ToolError> {
+        Ok(mason::ToolOutput {
+            text: "[image image/png attached]".into(),
+            images: vec![mason::llm::Image {
+                mime_type: "image/png".into(),
+                data: PNG.into(),
+            }],
+        })
+    }
+}
+
+#[tokio::test]
+async fn tool_images_reach_the_model_and_the_oldest_drop_when_over_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let shots = (1..=3)
+        .map(|n| (format!("c{n}"), "shot".to_owned(), "{}".to_owned()))
+        .collect();
+    let (mut config, model) = config(
+        vec![calls(shots), answer("seen")],
+        vec![Box::new(ShotTool)],
+        dir.path(),
+    )
+    .await;
+    // room for two images, not three
+    config.max_tokens = Some(2 * mason::context::IMAGE_TOKENS + 500);
+    let outcome = engine::run(config).await.unwrap();
+    assert_eq!(outcome.answer, "seen");
+
+    let sent = &model.requests()[1].messages;
+    let images: Vec<usize> = sent
+        .iter()
+        .filter(|message| message.role == Role::Tool)
+        .map(|message| message.images.len())
+        .collect();
+    assert_eq!(images, [0, 1, 1], "the oldest image is dropped first");
+    assert!(
+        sent[2]
+            .content
+            .as_deref()
+            .unwrap()
+            .ends_with("[Images dropped for context]")
+    );
+    let kept: usize = outcome
+        .messages
+        .iter()
+        .map(|message| message.images.len())
+        .sum();
+    assert_eq!(kept, 3, "the conversation keeps every image");
+}
+
+#[tokio::test]
+async fn committed_messages_carry_estimated_tokens_and_provider_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut config, _model) = config(
+        vec![
+            call_id("c1", "shot", "{}"),
+            Reply::Deltas(vec![
+                ChatDelta::Text("seen".into()),
+                ChatDelta::Usage {
+                    prompt_tokens: 1234,
+                    completion_tokens: 5,
+                },
+            ]),
+        ],
+        vec![Box::new(ShotTool)],
+        dir.path(),
+    )
+    .await;
+    let saved = Arc::new(Mutex::new(Vec::new()));
+    config.persist = Some(Arc::new({
+        let saved = saved.clone();
+        move |_turn, message: Message, tokens| {
+            saved.lock().unwrap().push((message, tokens));
+            Box::pin(async { Ok(()) })
+        }
+    }));
+    let (tx, mut rx) = mpsc::channel(64);
+    config.events = Some(tx);
+    engine::run(config).await.unwrap();
+
+    let saved = saved.lock().unwrap().clone();
+    let [
+        (call, call_tokens),
+        (result, result_tokens),
+        (answer, answer_tokens),
+    ] = &saved[..]
+    else {
+        panic!("three committed messages: {saved:?}")
+    };
+    for (message, tokens) in [
+        (call, call_tokens),
+        (result, result_tokens),
+        (answer, answer_tokens),
+    ] {
+        assert_eq!(
+            tokens.estimated,
+            mason::context::estimate_tokens(std::slice::from_ref(message))
+        );
+    }
+    assert!(
+        result_tokens.estimated > mason::context::IMAGE_TOKENS,
+        "the image counts"
+    );
+    assert_eq!((call_tokens.usage, result_tokens.usage), (None, None));
+    assert_eq!(
+        answer_tokens.usage,
+        Some(mason::llm::Usage {
+            prompt_tokens: 1234,
+            completion_tokens: 5
+        }),
+        "a reply carries the usage of the request that produced it"
+    );
+
+    let mut streamed = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let RunEvent::Committed { tokens, .. } = event {
+            streamed.push(tokens);
+        }
+    }
+    let persisted: Vec<_> = saved.iter().map(|(_, tokens)| *tokens).collect();
+    assert_eq!(streamed, persisted, "the stream carries the same counts");
+}
+
+struct SvgTool;
+
+#[async_trait::async_trait]
+impl mason::Tool for SvgTool {
+    fn spec(&self) -> mason::ToolSpec {
+        mason::ToolSpec::function("svg", "vector image", serde_json::json!({"type": "object"}))
+    }
+    async fn call(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &mason::ToolCtx,
+    ) -> std::result::Result<mason::ToolOutput, mason::ToolError> {
+        Ok(mason::ToolOutput {
+            text: "[image image/svg+xml attached]".into(),
+            images: vec![
+                mason::llm::Image {
+                    mime_type: "image/svg+xml".into(),
+                    data: "PHN2Zy8+".into(),
+                },
+                mason::llm::Image {
+                    mime_type: "image/jpeg".into(),
+                    data: PNG.into(),
+                },
+            ],
+        })
+    }
+}
+
+#[tokio::test]
+async fn unusable_tool_images_are_dropped_with_a_note_and_labels_are_corrected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (config, _model) = config(
+        vec![call("svg", "{}"), answer("done")],
+        vec![Box::new(SvgTool)],
+        dir.path(),
+    )
+    .await;
+    let outcome = engine::run(config).await.unwrap();
+    let result = outcome
+        .messages
+        .iter()
+        .find(|message| message.role == Role::Tool)
+        .unwrap();
+    assert!(
+        result
+            .content
+            .as_deref()
+            .unwrap()
+            .ends_with("[1 image(s) omitted: not a usable PNG, JPEG, WebP or GIF]"),
+        "{result:?}"
+    );
+    assert_eq!(
+        result.images,
+        [mason::llm::Image {
+            mime_type: "image/png".into(),
+            data: PNG.into(),
+        }],
+        "the kept image is labelled by its bytes"
+    );
+}
+
+#[tokio::test]
+async fn a_new_screenshot_survives_while_older_text_is_shortened() {
+    let run = |max_tokens: Option<usize>| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (big, _) = EchoTool::boxed("big", &"x".repeat(1600));
+        let (mut config, model) = config(
+            vec![
+                call_id("c1", "big", "{}"),
+                call_id("c2", "shot", "{}"),
+                answer("done"),
+            ],
+            vec![big, Box::new(ShotTool)],
+            dir.path(),
+        )
+        .await;
+        config.max_tokens = max_tokens;
+        engine::run(config).await.unwrap();
+        model.requests().remove(2)
+    };
+    let full = run(None).await;
+    let size = mason::context::estimate_tokens(&full.messages)
+        + mason::context::estimate_str(&serde_json::to_string(&full.tools).unwrap());
+    // Slightly over budget: too little to prune, so the tool text is shortened.
+    let sent = run(Some(size - 60)).await.messages;
+    let result = |id: &str| {
+        sent.iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(id))
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        result("c2").images.len(),
+        1,
+        "the unseen screenshot is kept"
+    );
+    assert!(
+        result("c1")
+            .content
+            .unwrap()
+            .contains("[Shortened for context;"),
+        "the older text gives way first"
+    );
 }
