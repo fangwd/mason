@@ -1,7 +1,9 @@
 //! LLM client integration tests over HTTP.
 
+use mason::config::DEFAULT_MAX_RESPONSE_BYTES;
 use mason::{
-    CancellationToken, ChatModel, ChatRequest, ChatTurn, Message, Usage, VendorModel, Vendors,
+    CancellationToken, ChatModel, ChatRequest, Message, TurnAccumulator, Usage, VendorModel,
+    Vendors,
 };
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -59,7 +61,10 @@ async fn streams_over_real_http() {
         .stream(request(), &CancellationToken::new())
         .await
         .unwrap();
-    let turn = ChatTurn::fold(stream).await.unwrap();
+    let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+        .fold(stream)
+        .await
+        .unwrap();
     assert_eq!(turn.message.content.as_deref(), Some("Hello"));
     assert_eq!(
         turn.usage,
@@ -92,7 +97,10 @@ async fn single_shot_vendors_post_without_stream_flags() {
         .stream(request(), &CancellationToken::new())
         .await
         .unwrap();
-    let turn = ChatTurn::fold(stream).await.unwrap();
+    let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+        .fold(stream)
+        .await
+        .unwrap();
     assert_eq!(turn.message.content.as_deref(), Some("Hello"));
     assert_eq!(
         turn.usage,
@@ -129,7 +137,10 @@ async fn a_non_retryable_status_is_terminal() {
         .stream(request(), &CancellationToken::new())
         .await
         .unwrap();
-    let err = ChatTurn::fold(stream).await.unwrap_err();
+    let err = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+        .fold(stream)
+        .await
+        .unwrap_err();
     assert!(err.to_string().starts_with("HTTP 401: nope"), "{err}");
 }
 
@@ -164,7 +175,10 @@ async fn a_retry_after_backoff_retries_over_real_http() {
         .stream(request(), &CancellationToken::new())
         .await
         .unwrap();
-    let turn = ChatTurn::fold(stream).await.unwrap();
+    let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+        .fold(stream)
+        .await
+        .unwrap();
     assert_eq!(turn.message.content.as_deref(), Some("Hello"));
 }
 
@@ -202,7 +216,8 @@ async fn keyless_vendors_send_their_headers_and_extra_body_without_authorization
         .await
         .unwrap();
     assert_eq!(
-        ChatTurn::fold(stream)
+        TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(stream)
             .await
             .unwrap()
             .message

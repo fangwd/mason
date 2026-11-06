@@ -5,6 +5,7 @@ mod support;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use mason::config::DEFAULT_MAX_RESPONSE_BYTES;
 use mason::context::{compact_conversation, in_memory_compactor, summarize};
 use mason::{ChatDelta, ChatRequest, Message, PromptSource, Role, ToolCall, Usage, engine};
 use support::{EchoTool, FunctionModel, Reply, ScriptedModel, answer, config, is_summary_request};
@@ -76,7 +77,12 @@ async fn compacts_before_an_oversized_request_keeping_the_recent_tail() {
     run_config.model = model.clone();
     run_config.messages = messages;
     run_config.max_tokens = Some(2_000);
-    run_config.compact = Some(in_memory_compactor(model.clone(), prompts.clone(), 2_000));
+    run_config.compact = Some(in_memory_compactor(
+        model.clone(),
+        prompts.clone(),
+        2_000,
+        DEFAULT_MAX_RESPONSE_BYTES,
+    ));
 
     let outcome = engine::run(run_config).await.unwrap();
     assert_eq!(outcome.answer, "answer");
@@ -155,7 +161,12 @@ async fn compaction_summarizes_original_results_not_pruned_placeholders() {
     run_config.model = model.clone();
     run_config.messages = messages;
     run_config.max_tokens = Some(2_000);
-    run_config.compact = Some(in_memory_compactor(model.clone(), prompts, 2_000));
+    run_config.compact = Some(in_memory_compactor(
+        model.clone(),
+        prompts,
+        2_000,
+        DEFAULT_MAX_RESPONSE_BYTES,
+    ));
 
     let outcome = engine::run(run_config).await.unwrap();
     assert_eq!(outcome.answer, "answer");
@@ -191,10 +202,17 @@ async fn the_next_compaction_merges_the_previous_summary() {
 
     // First compaction of a conversation without a checkpoint; a tight budget
     // folds it in several chunks.
-    let first = compact_conversation(&seeded(4, 1_000), 2_000, &*model, &prompts, &token)
-        .await
-        .unwrap()
-        .expect("there is a head to summarize");
+    let first = compact_conversation(
+        &seeded(4, 1_000),
+        2_000,
+        DEFAULT_MAX_RESPONSE_BYTES,
+        &*model,
+        &prompts,
+        &token,
+    )
+    .await
+    .unwrap()
+    .expect("there is a head to summarize");
     let first_summary = format!("SUMMARY {}", summaries.load(Ordering::SeqCst));
     assert!(
         first[1]
@@ -208,10 +226,17 @@ async fn the_next_compaction_merges_the_previous_summary() {
     let mut grown = first;
     grown.push(call_message("c9"));
     grown.push(result("c9", 1_500));
-    let second = compact_conversation(&grown, 2_000, &*model, &prompts, &token)
-        .await
-        .unwrap()
-        .expect("the grown head is summarizable");
+    let second = compact_conversation(
+        &grown,
+        2_000,
+        DEFAULT_MAX_RESPONSE_BYTES,
+        &*model,
+        &prompts,
+        &token,
+    )
+    .await
+    .unwrap()
+    .expect("the grown head is summarizable");
     let requests = model.requests();
     let input = requests[first_count].messages[1].content.clone().unwrap();
     assert!(
@@ -259,7 +284,12 @@ async fn the_current_request_survives_compaction_verbatim() {
     run_config.model = model.clone();
     run_config.messages = messages;
     run_config.max_tokens = Some(2_000);
-    run_config.compact = Some(in_memory_compactor(model.clone(), prompts, 2_000));
+    run_config.compact = Some(in_memory_compactor(
+        model.clone(),
+        prompts,
+        2_000,
+        DEFAULT_MAX_RESPONSE_BYTES,
+    ));
 
     let outcome = engine::run(run_config).await.unwrap();
     assert_eq!(outcome.answer, "done");
@@ -321,6 +351,7 @@ async fn compacts_and_retries_once_when_the_provider_reports_an_overflow() {
         model.clone(),
         prompts,
         mason::context::usable_tokens(1_000_000).unwrap(),
+        DEFAULT_MAX_RESPONSE_BYTES,
     ));
 
     let outcome = engine::run(run_config).await.unwrap();
@@ -343,7 +374,12 @@ async fn an_uncompactable_run_fails_with_the_provider_error() {
     run_config.model = model.clone();
     run_config.messages = vec![Message::user("hi")];
     run_config.max_tokens = Some(980_000);
-    run_config.compact = Some(in_memory_compactor(model.clone(), prompts, 980_000));
+    run_config.compact = Some(in_memory_compactor(
+        model.clone(),
+        prompts,
+        980_000,
+        DEFAULT_MAX_RESPONSE_BYTES,
+    ));
 
     let err = engine::run(run_config).await.unwrap_err();
     assert!(err.to_string().contains("prompt is too long"), "{err}");
@@ -396,7 +432,12 @@ async fn usage_is_recorded_and_estimates_still_drive_compaction() {
     run_config.max_tokens = Some(500);
     // Summary requests have their own prompt and need a larger budget than
     // this deliberately tiny main-request limit.
-    run_config.compact = Some(in_memory_compactor(model.clone(), prompts, 2_000));
+    run_config.compact = Some(in_memory_compactor(
+        model.clone(),
+        prompts,
+        2_000,
+        DEFAULT_MAX_RESPONSE_BYTES,
+    ));
 
     let outcome = engine::run(run_config).await.unwrap();
     assert_eq!(outcome.answer, "done");
@@ -432,6 +473,7 @@ async fn an_empty_summary_fails() {
         &[Message::user("q1"), call_message("c1"), result("c1", 10)],
         None,
         100_000,
+        DEFAULT_MAX_RESPONSE_BYTES,
         &CancellationToken::new(),
     )
     .await
@@ -450,6 +492,7 @@ async fn oversized_prior_summary_is_folded_into_the_conversation() {
         &[Message::user("hello")],
         Some(&"x".repeat(20_000)),
         usable,
+        DEFAULT_MAX_RESPONSE_BYTES,
         &CancellationToken::new(),
     )
     .await
@@ -477,6 +520,7 @@ async fn a_folded_summary_that_stays_oversized_is_clipped_so_history_is_reached(
         &[Message::user("hello")],
         Some(&"x".repeat(20_000)),
         usable,
+        DEFAULT_MAX_RESPONSE_BYTES,
         &CancellationToken::new(),
     )
     .await
@@ -508,6 +552,7 @@ async fn a_budget_below_the_compaction_prompt_fails_before_requesting() {
         &[Message::user("hello")],
         None,
         100,
+        DEFAULT_MAX_RESPONSE_BYTES,
         &CancellationToken::new(),
     )
     .await
@@ -532,6 +577,7 @@ async fn history_larger_than_the_context_is_summarized_in_chunks() {
         &history,
         None,
         usable,
+        DEFAULT_MAX_RESPONSE_BYTES,
         &CancellationToken::new(),
     )
     .await
@@ -549,4 +595,22 @@ async fn history_larger_than_the_context_is_summarized_in_chunks() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn a_summary_over_the_response_byte_limit_fails() {
+    let prompts = PromptSource::Embedded.load().unwrap();
+    let model = ScriptedModel::new(vec![answer(&"s".repeat(300))]);
+    let err = summarize(
+        &*model,
+        &prompts,
+        &[Message::user("hello")],
+        None,
+        100_000,
+        256,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("byte limit"), "{err}");
 }

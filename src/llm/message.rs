@@ -237,7 +237,7 @@ struct CallFragments {
     arguments: String,
 }
 
-/// Accumulates deltas while the engine forwards them; also used by [`ChatTurn::fold`].
+/// Accumulates deltas while the engine forwards them, or folds a whole stream.
 #[derive(Debug)]
 pub struct TurnAccumulator {
     text: String,
@@ -253,8 +253,9 @@ pub struct TurnAccumulator {
     finish_reason: Option<String>,
 }
 
-impl Default for TurnAccumulator {
-    fn default() -> Self {
+impl TurnAccumulator {
+    /// `max_bytes` bounds text, reasoning and tool-call fragments across the whole turn.
+    pub fn new(max_bytes: usize) -> Self {
         Self {
             text: String::new(),
             reasoning: String::new(),
@@ -263,22 +264,10 @@ impl Default for TurnAccumulator {
             usage: None,
             completed: false,
             finish_reason: None,
-            max_bytes: 8 * 1024 * 1024,
+            max_bytes,
             received_bytes: 0,
             exceeded: false,
         }
-    }
-}
-
-impl TurnAccumulator {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Bound text, reasoning and tool-call fragments across the whole turn.
-    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
-        self.max_bytes = max_bytes;
-        self
     }
 
     /// Accumulates one delta; returns `true` on [`ChatDelta::Done`], after
@@ -355,6 +344,17 @@ impl TurnAccumulator {
         false
     }
 
+    /// Folds a stream to completion without forwarding deltas.
+    pub async fn fold(mut self, stream: impl Stream<Item = Result<ChatDelta>>) -> Result<ChatTurn> {
+        futures_util::pin_mut!(stream);
+        while let Some(item) = stream.next().await {
+            if self.push(item?) {
+                break;
+            }
+        }
+        self.finish()
+    }
+
     /// Rejects incomplete turns and missing tool IDs/names; argument JSON is validated
     /// by the engine.
     pub fn finish(mut self) -> Result<ChatTurn> {
@@ -410,22 +410,9 @@ impl TurnAccumulator {
     }
 }
 
-impl ChatTurn {
-    /// Folds a stream to completion without forwarding deltas.
-    pub async fn fold(stream: impl Stream<Item = Result<ChatDelta>>) -> Result<Self> {
-        futures_util::pin_mut!(stream);
-        let mut accumulator = TurnAccumulator::new();
-        while let Some(item) = stream.next().await {
-            if accumulator.push(item?) {
-                break;
-            }
-        }
-        accumulator.finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::config::DEFAULT_MAX_RESPONSE_BYTES;
     use futures_util::stream;
 
     use super::*;
@@ -499,21 +486,22 @@ mod tests {
 
     #[tokio::test]
     async fn fold_concatenates_text_and_reasoning_fragments() {
-        let turn = ChatTurn::fold(stream_of(ok(vec![
-            ChatDelta::Text("Hel".into()),
-            ChatDelta::Reasoning("hmm".into()),
-            ChatDelta::Text("lo".into()),
-            ChatDelta::Usage(Usage {
-                prompt_tokens: 10,
-                completion_tokens: 5,
-                ..Default::default()
-            }),
-            ChatDelta::Done {
-                finish_reason: Some("stop".into()),
-            },
-        ])))
-        .await
-        .unwrap();
+        let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(stream_of(ok(vec![
+                ChatDelta::Text("Hel".into()),
+                ChatDelta::Reasoning("hmm".into()),
+                ChatDelta::Text("lo".into()),
+                ChatDelta::Usage(Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    ..Default::default()
+                }),
+                ChatDelta::Done {
+                    finish_reason: Some("stop".into()),
+                },
+            ])))
+            .await
+            .unwrap();
         assert_eq!(turn.message.content.as_deref(), Some("Hello"));
         assert_eq!(turn.message.reasoning_content.as_deref(), Some("hmm"));
         assert_eq!(turn.message.tool_calls, None);
@@ -531,17 +519,18 @@ mod tests {
     async fn fold_joins_tool_calls_per_index_in_index_order() {
         // Fragments arrive out of index order and id/name lag behind the
         // first arguments fragment.
-        let turn = ChatTurn::fold(stream_of(ok(vec![
-            call(1, None, None, "{\"b\":"),
-            call(0, Some("c0"), Some("read"), "{\"a\""),
-            call(1, Some("c1"), Some("write"), "2}"),
-            call(0, None, None, ":1}"),
-            ChatDelta::Done {
-                finish_reason: Some("tool_calls".into()),
-            },
-        ])))
-        .await
-        .unwrap();
+        let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(stream_of(ok(vec![
+                call(1, None, None, "{\"b\":"),
+                call(0, Some("c0"), Some("read"), "{\"a\""),
+                call(1, Some("c1"), Some("write"), "2}"),
+                call(0, None, None, ":1}"),
+                ChatDelta::Done {
+                    finish_reason: Some("tool_calls".into()),
+                },
+            ])))
+            .await
+            .unwrap();
         assert_eq!(turn.message.content, None, "a tool turn has null content");
         assert_eq!(
             turn.message.tool_calls.unwrap(),
@@ -554,17 +543,18 @@ mod tests {
 
     #[tokio::test]
     async fn fold_starts_a_new_call_when_an_index_carries_a_new_id() {
-        let turn = ChatTurn::fold(stream_of(ok(vec![
-            call(0, Some("c0"), Some("read"), "{\"a\""),
-            call(0, None, None, ":1}"),
-            call(0, Some("c1"), Some("write"), "{\"b\""),
-            call(0, None, None, ":2}"),
-            ChatDelta::Done {
-                finish_reason: Some("tool_calls".into()),
-            },
-        ])))
-        .await
-        .unwrap();
+        let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(stream_of(ok(vec![
+                call(0, Some("c0"), Some("read"), "{\"a\""),
+                call(0, None, None, ":1}"),
+                call(0, Some("c1"), Some("write"), "{\"b\""),
+                call(0, None, None, ":2}"),
+                ChatDelta::Done {
+                    finish_reason: Some("tool_calls".into()),
+                },
+            ])))
+            .await
+            .unwrap();
         assert_eq!(
             turn.message.tool_calls.unwrap(),
             vec![
@@ -576,15 +566,16 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_id_on_a_continuation_fragment_does_not_split_the_call() {
-        let turn = ChatTurn::fold(stream_of(ok(vec![
-            call(0, Some("c0"), Some("read"), "{\"a\""),
-            call(0, Some(""), None, ":1}"),
-            ChatDelta::Done {
-                finish_reason: Some("tool_calls".into()),
-            },
-        ])))
-        .await
-        .unwrap();
+        let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(stream_of(ok(vec![
+                call(0, Some("c0"), Some("read"), "{\"a\""),
+                call(0, Some(""), None, ":1}"),
+                ChatDelta::Done {
+                    finish_reason: Some("tool_calls".into()),
+                },
+            ])))
+            .await
+            .unwrap();
         assert_eq!(
             turn.message.tool_calls.unwrap(),
             vec![ToolCall::new("c0", "read", "{\"a\":1}")]
@@ -593,14 +584,15 @@ mod tests {
 
     #[tokio::test]
     async fn fold_carries_the_finish_reason() {
-        let turn = ChatTurn::fold(stream_of(ok(vec![
-            ChatDelta::Text("partial".into()),
-            ChatDelta::Done {
-                finish_reason: Some("length".into()),
-            },
-        ])))
-        .await
-        .unwrap();
+        let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(stream_of(ok(vec![
+                ChatDelta::Text("partial".into()),
+                ChatDelta::Done {
+                    finish_reason: Some("length".into()),
+                },
+            ])))
+            .await
+            .unwrap();
         assert_eq!(turn.finish_reason.as_deref(), Some("length"));
     }
 
@@ -617,7 +609,10 @@ mod tests {
                 },
             ],
         ] {
-            let turn = ChatTurn::fold(stream_of(ok(deltas))).await.unwrap();
+            let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+                .fold(stream_of(ok(deltas)))
+                .await
+                .unwrap();
             assert_eq!(turn.message.content.as_deref(), Some(""));
             let wire = serde_json::to_value(&turn.message).unwrap();
             assert_eq!(wire["content"], serde_json::json!(""), "{wire}");
@@ -627,14 +622,15 @@ mod tests {
     #[tokio::test]
     async fn fold_keeps_invalid_argument_json_for_the_engine() {
         // Not parsed here: the engine turns it into a fixable tool error.
-        let turn = ChatTurn::fold(stream_of(ok(vec![
-            call(0, Some("c0"), Some("read"), "{oops"),
-            ChatDelta::Done {
-                finish_reason: None,
-            },
-        ])))
-        .await
-        .unwrap();
+        let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(stream_of(ok(vec![
+                call(0, Some("c0"), Some("read"), "{oops"),
+                ChatDelta::Done {
+                    finish_reason: None,
+                },
+            ])))
+            .await
+            .unwrap();
         assert_eq!(
             turn.message.tool_calls.unwrap()[0].function.arguments,
             "{oops"
@@ -657,14 +653,18 @@ mod tests {
                 },
             ],
         ] {
-            let err = ChatTurn::fold(stream_of(ok(broken))).await.unwrap_err();
+            let err = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+                .fold(stream_of(ok(broken)))
+                .await
+                .unwrap_err();
             assert!(err.to_string().contains("tool call 0"), "{err}");
         }
     }
 
     #[tokio::test]
     async fn fold_rejects_a_stream_that_ends_without_done() {
-        let err = ChatTurn::fold(stream_of(ok(vec![ChatDelta::Text("hi".into())])))
+        let err = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(stream_of(ok(vec![ChatDelta::Text("hi".into())])))
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Llm(LlmError::Protocol(_))), "{err}");
@@ -676,12 +676,13 @@ mod tests {
 
     #[tokio::test]
     async fn fold_propagates_stream_errors() {
-        let err = ChatTurn::fold(stream_of(vec![
-            Ok(ChatDelta::Text("partial".into())),
-            Err(Error::Llm(LlmError::Transport("reset".into()))),
-        ]))
-        .await
-        .unwrap_err();
+        let err = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(stream_of(vec![
+                Ok(ChatDelta::Text("partial".into())),
+                Err(Error::Llm(LlmError::Transport("reset".into()))),
+            ]))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("reset"), "{err}");
     }
 }

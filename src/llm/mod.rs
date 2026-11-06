@@ -879,6 +879,7 @@ fn request_deadline_error(timeout: Duration) -> LlmError {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::DEFAULT_MAX_RESPONSE_BYTES;
     use std::result::Result as StdResult;
     use std::sync::Mutex;
 
@@ -1047,7 +1048,10 @@ mod tests {
             .stream(ChatRequest::default(), &CancellationToken::new())
             .await
             .expect("the turn should start");
-        ChatTurn::fold(stream).await.expect("the turn should fold")
+        TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(stream)
+            .await
+            .expect("the turn should fold")
     }
 
     /// The next item, which must be a delta.
@@ -1074,7 +1078,10 @@ mod tests {
             canceller.cancel();
         });
         let stream = model.stream(ChatRequest::default(), &token).await.unwrap();
-        let err = ChatTurn::fold(stream).await.unwrap_err();
+        let err = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(stream)
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::Llm(LlmError::Cancelled)), "{err}");
         assert_eq!(
             transport.request_count(),
@@ -1099,7 +1106,10 @@ mod tests {
             .stream(ChatRequest::default(), &CancellationToken::new())
             .await
             .unwrap();
-        let err = ChatTurn::fold(stream).await.unwrap_err();
+        let err = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(stream)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, Error::Llm(LlmError::TurnDeadline { .. })),
             "{err}"
@@ -1133,14 +1143,15 @@ mod tests {
         ])]);
         let model = VendorModel::with_transport(vendors(2, true), transport.clone());
         let started = Instant::now();
-        let turn = ChatTurn::fold(
-            model
-                .stream(ChatRequest::default(), &CancellationToken::new())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(
+                model
+                    .stream(ChatRequest::default(), &CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(turn.message.content.as_deref(), Some("start a b c d"));
         assert!(started.elapsed() > TURN_BUDGET, "{:?}", started.elapsed());
         assert_eq!(transport.request_count(), 1, "nothing was retried");
@@ -1157,14 +1168,15 @@ mod tests {
             })
             .unwrap();
         let started = Instant::now();
-        let error = ChatTurn::fold(
-            model
-                .stream(ChatRequest::default(), &CancellationToken::new())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap_err();
+        let error = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(
+                model
+                    .stream(ChatRequest::default(), &CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(error, Error::Llm(LlmError::TurnDeadline { .. })));
         assert_eq!(started.elapsed(), Duration::from_secs(7));
         assert!(
@@ -1201,14 +1213,15 @@ mod tests {
         ]);
         let model = VendorModel::with_transport(vendors(2, true), transport.clone());
         let started = Instant::now();
-        let turn = ChatTurn::fold(
-            model
-                .stream(ChatRequest::default(), &CancellationToken::new())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(
+                model
+                    .stream(ChatRequest::default(), &CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(turn.message.content.as_deref(), Some("healthy"));
         assert_eq!(transport.request_count(), 2);
         assert_eq!(started.elapsed(), IDLE_TIMEOUT);
@@ -1239,14 +1252,15 @@ mod tests {
             ]),
         ]);
         let model = VendorModel::with_transport(vendors(2, true), transport.clone());
-        let turn = ChatTurn::fold(
-            model
-                .stream(ChatRequest::default(), &CancellationToken::new())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(
+                model
+                    .stream(ChatRequest::default(), &CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(turn.message.content.as_deref(), Some("hello"));
         let requests = transport.requests();
         let names: Vec<&str> = requests.iter().map(|(name, _)| name.as_str()).collect();
@@ -1268,14 +1282,15 @@ mod tests {
             ok_stream(vec![text_event("hi"), finish_event("stop"), done_event()]),
         ]);
         let model = VendorModel::with_transport(vendors(2, true), transport.clone());
-        let turn = ChatTurn::fold(
-            model
-                .stream(ChatRequest::default(), &CancellationToken::new())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(
+                model
+                    .stream(ChatRequest::default(), &CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(turn.message.content.as_deref(), Some("hi"));
         let requests = transport.requests();
         let names: Vec<&str> = requests.iter().map(|(name, _)| name.as_str()).collect();
@@ -1297,14 +1312,15 @@ mod tests {
             ]),
         ]);
         let model = VendorModel::with_transport(vendors(2, true), transport.clone());
-        let err = ChatTurn::fold(
-            model
-                .stream(ChatRequest::default(), &CancellationToken::new())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap_err();
+        let err = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(
+                model
+                    .stream(ChatRequest::default(), &CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
         let Error::Llm(llm_err) = &err else {
             panic!("{err}");
         };
@@ -1329,14 +1345,15 @@ mod tests {
             ok_stream(vec![text_event("hi"), finish_event("stop"), done_event()]),
         ]);
         let model = VendorModel::with_transport(vendors(1, true), transport.clone());
-        let turn = ChatTurn::fold(
-            model
-                .stream(ChatRequest::default(), &CancellationToken::new())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(
+                model
+                    .stream(ChatRequest::default(), &CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(turn.message.content.as_deref(), Some("hi"));
         assert_eq!(
             transport.request_count(),
@@ -1355,14 +1372,15 @@ mod tests {
             ok_stream(vec![text_event("hi"), finish_event("stop"), done_event()]),
         ]);
         let model = VendorModel::with_transport(vendors(1, true), transport.clone());
-        let turn = ChatTurn::fold(
-            model
-                .stream(ChatRequest::default(), &CancellationToken::new())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(
+                model
+                    .stream(ChatRequest::default(), &CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(turn.message.content.as_deref(), Some("hi"));
         assert_eq!(transport.request_count(), 2);
     }
@@ -1445,14 +1463,15 @@ mod tests {
                 ok_stream(vec![text_event("hi"), finish_event("stop"), done_event()]),
             ]);
             let model = VendorModel::with_transport(vendors(2, true), transport.clone());
-            let turn = ChatTurn::fold(
-                model
-                    .stream(ChatRequest::default(), &CancellationToken::new())
-                    .await
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+            let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+                .fold(
+                    model
+                        .stream(ChatRequest::default(), &CancellationToken::new())
+                        .await
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
             assert_eq!(turn.message.content.as_deref(), Some("hi"));
             let requests = transport.requests();
             let names: Vec<&str> = requests.iter().map(|(name, _)| name.as_str()).collect();
@@ -1489,14 +1508,15 @@ mod tests {
             ok_stream(vec![text_event("hi"), finish_event("stop"), done_event()]),
         ]);
         let model = VendorModel::with_transport(vendors(1, true), transport.clone());
-        let turn = ChatTurn::fold(
-            model
-                .stream(ChatRequest::default(), &CancellationToken::new())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(
+                model
+                    .stream(ChatRequest::default(), &CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(turn.message.content.as_deref(), Some("hi"));
         assert_eq!(
             transport.request_count(),
@@ -1608,14 +1628,15 @@ mod tests {
             ]),
         ]);
         let model = VendorModel::with_transport(vendors(1, true), transport.clone());
-        let turn = ChatTurn::fold(
-            model
-                .stream(ChatRequest::default(), &CancellationToken::new())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(
+                model
+                    .stream(ChatRequest::default(), &CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(
             turn.message.content.as_deref(),
             Some("hello"),
@@ -1661,14 +1682,15 @@ mod tests {
             ok_stream(vec![]),
         ]);
         let model = VendorModel::with_transport(vendors(1, true), transport.clone());
-        let err = ChatTurn::fold(
-            model
-                .stream(ChatRequest::default(), &CancellationToken::new())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap_err();
+        let err = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(
+                model
+                    .stream(ChatRequest::default(), &CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("ended before the turn completed"),
             "{err}"
@@ -1678,14 +1700,15 @@ mod tests {
         // After output was forwarded: terminal with a single attempt.
         let transport = ScriptedTransport::new(vec![ok_stream(vec![text_event("hi")])]);
         let model = VendorModel::with_transport(vendors(1, true), transport.clone());
-        let err = ChatTurn::fold(
-            model
-                .stream(ChatRequest::default(), &CancellationToken::new())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap_err();
+        let err = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(
+                model
+                    .stream(ChatRequest::default(), &CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("ended before the turn completed"),
             "{err}"
@@ -1700,14 +1723,15 @@ mod tests {
             chunk("data: {\"choices\""),
         ])]);
         let model = VendorModel::with_transport(vendors(1, true), transport.clone());
-        let err = ChatTurn::fold(
-            model
-                .stream(ChatRequest::default(), &CancellationToken::new())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap_err();
+        let err = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(
+                model
+                    .stream(ChatRequest::default(), &CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("middle of an SSE line"), "{err}");
         assert_eq!(
             transport.request_count(),
@@ -1730,14 +1754,15 @@ mod tests {
             })
             .unwrap();
         let started = Instant::now();
-        let err = ChatTurn::fold(
-            model
-                .stream(ChatRequest::default(), &CancellationToken::new())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap_err();
+        let err = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(
+                model
+                    .stream(ChatRequest::default(), &CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("HTTP 429"), "{err}");
         assert_eq!(transport.request_count(), 1);
         assert!(
@@ -1753,14 +1778,15 @@ mod tests {
             ok_stream(vec![text_event("hi"), finish_event("stop"), done_event()]),
         ]);
         let model = VendorModel::with_transport(vendors(1, true), transport.clone());
-        let turn = ChatTurn::fold(
-            model
-                .stream(ChatRequest::default(), &CancellationToken::new())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let turn = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(
+                model
+                    .stream(ChatRequest::default(), &CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(turn.message.content.as_deref(), Some("hi"));
         assert_eq!(transport.request_count(), 2);
     }
@@ -1857,14 +1883,15 @@ mod tests {
     async fn malformed_chunk_data_errors_without_panic() {
         let transport = ScriptedTransport::new(vec![ok_stream(vec![chunk("data: not json\n\n")])]);
         let model = VendorModel::with_transport(vendors(1, true), transport.clone());
-        let err = ChatTurn::fold(
-            model
-                .stream(ChatRequest::default(), &CancellationToken::new())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap_err();
+        let err = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(
+                model
+                    .stream(ChatRequest::default(), &CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("cannot decode a response chunk"),
             "{err}"
@@ -1973,14 +2000,15 @@ mod tests {
             ))],
         }]);
         let model = VendorModel::with_transport(vendors(1, true), transport.clone());
-        let err = ChatTurn::fold(
-            model
-                .stream(ChatRequest::default(), &CancellationToken::new())
-                .await
-                .unwrap(),
-        )
-        .await
-        .unwrap_err();
+        let err = TurnAccumulator::new(DEFAULT_MAX_RESPONSE_BYTES)
+            .fold(
+                model
+                    .stream(ChatRequest::default(), &CancellationToken::new())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap_err();
         let rendered = err.to_string();
         assert!(rendered.starts_with("HTTP 400: data:"), "{rendered}");
         assert!(is_context_overflow(&rendered), "{rendered}");

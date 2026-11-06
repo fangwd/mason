@@ -9,7 +9,8 @@ use tokio_util::sync::CancellationToken;
 use crate::Error;
 use crate::engine::CompactFn;
 use crate::error::Result;
-use crate::llm::{ChatModel, ChatRequest, ChatTurn, Message, Role};
+use crate::llm::message::TurnAccumulator;
+use crate::llm::{ChatModel, ChatRequest, Message, Role};
 use crate::prompt::PromptSet;
 
 /// Room a reply may need: requests are planned against
@@ -238,6 +239,7 @@ pub async fn summarize(
     messages: &[Message],
     previous_summary: Option<&str>,
     usable: usize,
+    max_response_bytes: usize,
     token: &CancellationToken,
 ) -> Result<String> {
     let system = Message::system(prompts.compaction.system.clone());
@@ -298,7 +300,16 @@ pub async fn summarize(
             ));
         }
         summary = Some(
-            summarize_chunk(model, &system, prompts, &chunk, summary.as_deref(), token).await?,
+            summarize_chunk(
+                model,
+                &system,
+                prompts,
+                &chunk,
+                summary.as_deref(),
+                max_response_bytes,
+                token,
+            )
+            .await?,
         );
     }
     summary.ok_or_else(|| Error::Run("there was nothing to summarize".to_owned()))
@@ -323,6 +334,7 @@ async fn summarize_chunk(
     prompts: &PromptSet,
     context: &[String],
     previous_summary: Option<&str>,
+    max_response_bytes: usize,
     token: &CancellationToken,
 ) -> Result<String> {
     let request = ChatRequest {
@@ -332,7 +344,9 @@ async fn summarize_chunk(
         ],
         tools: Vec::new(),
     };
-    let turn = ChatTurn::fold(model.stream(request, token).await?).await?;
+    let turn = TurnAccumulator::new(max_response_bytes)
+        .fold(model.stream(request, token).await?)
+        .await?;
     let summary = turn.message.content.unwrap_or_default();
     let summary = summary.trim();
     if summary.is_empty() {
@@ -347,13 +361,22 @@ pub fn in_memory_compactor(
     model: Arc<dyn ChatModel>,
     prompts: Arc<PromptSet>,
     usable: usize,
+    max_response_bytes: usize,
 ) -> CompactFn {
     Arc::new(move |messages: Vec<Message>, token: CancellationToken| {
         let model = model.clone();
         let prompts = prompts.clone();
-        Box::pin(
-            async move { compact_conversation(&messages, usable, &*model, &prompts, &token).await },
-        )
+        Box::pin(async move {
+            compact_conversation(
+                &messages,
+                usable,
+                max_response_bytes,
+                &*model,
+                &prompts,
+                &token,
+            )
+            .await
+        })
     })
 }
 
@@ -362,6 +385,7 @@ pub fn in_memory_compactor(
 pub async fn compact_conversation(
     messages: &[Message],
     usable: usize,
+    max_response_bytes: usize,
     model: &dyn ChatModel,
     prompts: &PromptSet,
     token: &CancellationToken,
@@ -378,7 +402,16 @@ pub async fn compact_conversation(
     if head.is_empty() {
         return Ok(None);
     }
-    let summary = summarize(model, prompts, &head, previous.as_deref(), usable, token).await?;
+    let summary = summarize(
+        model,
+        prompts,
+        &head,
+        previous.as_deref(),
+        usable,
+        max_response_bytes,
+        token,
+    )
+    .await?;
     let mut compacted: Vec<Message> = Vec::new();
     if let Some(system) = system {
         compacted.push(system.clone());

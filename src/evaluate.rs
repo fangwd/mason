@@ -8,7 +8,8 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::Result;
-use crate::llm::{ChatModel, ChatRequest, ChatTurn, Message, ToolSpec};
+use crate::llm::message::TurnAccumulator;
+use crate::llm::{ChatModel, ChatRequest, Message, ToolSpec};
 use crate::prompt::PromptSet;
 use crate::reflect::{RunReview, transcript};
 
@@ -54,11 +55,13 @@ impl Verdict {
 /// Answers "did this run succeed?" for a finished run.
 #[async_trait::async_trait]
 pub trait Evaluator: Send + Sync {
-    /// `prompts` is the agent's snapshot; answerers that are not models may ignore it.
+    /// `prompts` and `max_response_bytes` are the agent's; answerers that are
+    /// not models may ignore them.
     async fn evaluate(
         &self,
         run: &RunReview<'_>,
         prompts: &PromptSet,
+        max_response_bytes: usize,
         token: &CancellationToken,
     ) -> Result<Verdict>;
 }
@@ -80,6 +83,7 @@ impl Evaluator for LlmEvaluator {
         &self,
         run: &RunReview<'_>,
         prompts: &PromptSet,
+        max_response_bytes: usize,
         token: &CancellationToken,
     ) -> Result<Verdict> {
         let request = ChatRequest {
@@ -91,7 +95,9 @@ impl Evaluator for LlmEvaluator {
             ],
             tools: vec![verdict_spec(&prompts.evaluation.tool)],
         };
-        let turn = ChatTurn::fold(self.model.stream(request, token).await?).await?;
+        let turn = TurnAccumulator::new(max_response_bytes)
+            .fold(self.model.stream(request, token).await?)
+            .await?;
         Ok(parse_verdict(&turn.message))
     }
 }
@@ -182,5 +188,46 @@ mod tests {
             assert_eq!(verdict.outcome, Outcome::Unclear);
             assert!(verdict.reason.contains(reason), "{}", verdict.reason);
         }
+    }
+
+    struct Wordy;
+
+    #[async_trait::async_trait]
+    impl ChatModel for Wordy {
+        fn context_tokens(&self) -> usize {
+            128_000
+        }
+
+        async fn stream(
+            &self,
+            _request: ChatRequest,
+            _token: &CancellationToken,
+        ) -> Result<crate::llm::ChatStream> {
+            let deltas = vec![
+                Ok(crate::llm::ChatDelta::Text("x".repeat(300))),
+                Ok(crate::llm::ChatDelta::Done {
+                    finish_reason: Some("stop".into()),
+                }),
+            ];
+            Ok(Box::pin(futures_util::stream::iter(deltas)))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reply_over_the_response_byte_limit_fails() {
+        let prompts = crate::prompt::PromptSource::Embedded.load().unwrap();
+        let messages = [Message::user("do it")];
+        let run = RunReview {
+            messages: &messages,
+            failed: false,
+            steered: false,
+            session: None,
+            verdict: None,
+        };
+        let err = LlmEvaluator::new(Arc::new(Wordy))
+            .evaluate(&run, &prompts, 256, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("byte limit"), "{err}");
     }
 }

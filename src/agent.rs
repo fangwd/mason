@@ -383,8 +383,12 @@ impl Agent {
                     .clone()
                     .unwrap_or_else(|| Arc::new(crate::tool::policy::AllowTools)),
             );
-        let compact =
-            crate::context::in_memory_compactor(inner.model.clone(), prompts.clone(), usable);
+        let compact = crate::context::in_memory_compactor(
+            inner.model.clone(),
+            prompts.clone(),
+            usable,
+            inner.limits.max_response_bytes,
+        );
         engine::run_with_token(
             RunConfig {
                 model: inner.model.clone(),
@@ -589,7 +593,10 @@ impl Agent {
             return Ok(None);
         };
         let prompts = self.inner.prompts.load()?;
-        evaluator.evaluate(run, &prompts, token).await.map(Some)
+        evaluator
+            .evaluate(run, &prompts, self.inner.limits.max_response_bytes, token)
+            .await
+            .map(Some)
     }
 
     /// Whether an evaluator grades finished runs.
@@ -1033,6 +1040,7 @@ fn store_compactor(
                 &head,
                 conversation.summary.as_deref(),
                 usable,
+                inner.limits.max_response_bytes,
                 &token,
             )
             .await?;
@@ -1117,7 +1125,11 @@ fn assemble(
         && !inner.model.accepts_images()
         && profile.allows("look")
     {
-        tools.push(Box::new(LookTool::new(&prompts.look, vision.clone())))?;
+        tools.push(Box::new(LookTool::new(
+            &prompts.look,
+            vision.clone(),
+            inner.limits.max_response_bytes,
+        )))?;
     }
     if let Some(launch) = launch
         && task_available(profile)
@@ -1219,7 +1231,12 @@ async fn run_child(
         );
     ctx.budget = request.budget;
     ctx.access = request.access;
-    let compact = crate::context::in_memory_compactor(inner.model.clone(), prompts.clone(), usable);
+    let compact = crate::context::in_memory_compactor(
+        inner.model.clone(),
+        prompts.clone(),
+        usable,
+        inner.limits.max_response_bytes,
+    );
     let outcome = engine::run_with_token(
         RunConfig {
             model: inner.model.clone(),

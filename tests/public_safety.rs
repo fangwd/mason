@@ -231,7 +231,7 @@ fn turn_byte_budget_bounds_text_reasoning_and_tool_arguments() {
             arguments: "x".repeat(65),
         },
     ] {
-        let mut accumulator = TurnAccumulator::new().with_max_bytes(64);
+        let mut accumulator = TurnAccumulator::new(64);
         assert!(accumulator.push(fragment));
         assert!(
             accumulator
@@ -241,7 +241,7 @@ fn turn_byte_budget_bounds_text_reasoning_and_tool_arguments() {
                 .contains("byte limit")
         );
     }
-    let mut accumulator = TurnAccumulator::new().with_max_bytes(64);
+    let mut accumulator = TurnAccumulator::new(64);
     assert!(!accumulator.push(ChatDelta::Text("x".repeat(32))));
     assert!(accumulator.push(ChatDelta::Reasoning("x".repeat(33))));
     assert!(accumulator.finish().is_err());

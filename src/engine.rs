@@ -998,7 +998,7 @@ async fn run_turn(
     budget.charge_tokens(input_tokens)?;
     let stream = model.stream(request, token).await?;
     futures_util::pin_mut!(stream);
-    let mut accumulator = TurnAccumulator::new().with_max_bytes(shared.max_response_bytes);
+    let mut accumulator = TurnAccumulator::new(shared.max_response_bytes);
     let mut seq = 0u32;
     while let Some(item) = stream.next().await {
         let delta = item?;
